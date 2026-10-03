@@ -30,13 +30,19 @@ can issue a thermostat command.
 
 `ProductId` uses `0xffff`, matching the sibling projects' generic sentinel. This
 is not an assigned Victron product ID or a claim to be Victron hardware.
-`GetText` returns hexadecimal product identity and the human-readable application
-version. The numeric firmware version is
-`major * 1_000_000 + minor * 1_000 + patch`, with each release component limited
-to 0–999. Canonical PEP 440 alpha, beta, release-candidate and development
-suffixes are accepted, including the release toolkit's `0.3.0b1` and
-`0.3.0.dev1000001` projections. Prereleases share their numeric base; `GetText`
-retains the full release identity. Hardware version is zero with the text `Virtual`.
+`GetText` returns hexadecimal product identity. Firmware `GetValue` and `GetText`
+both return the full canonical PEP 440 release string, including the release
+toolkit's `0.3.0b1` and `0.3.0.dev1000001` projections. Hardware version is the
+string `Virtual` in both representations.
+
+Although the general D-Bus API recommends numeric firmware versions, GUI v2
+[formats raw integer versions as Victron hex/BCD and explicitly preserves string versions](https://github.com/victronenergy/gui-v2/blob/main/components/FirmwareVersion.qml).
+Its [device information item](https://github.com/victronenergy/gui-v2/blob/main/components/listitems/ListFirmwareVersion.qml)
+uses the raw value, not `GetText`. A decimal encoding such as 3000 therefore
+appears as `vB.B8`. Publishing the supported string representation keeps the
+actual three-part application version and prerelease identity visible in both
+GUI generations. This virtual device does not advertise Victron firmware-update
+interfaces that need a numeric hardware firmware version.
 
 The [Victron D-Bus API](https://github.com/victronenergy/venus/wiki/dbus-api)
 prefers unsigned 32-bit product identity. The application supplies a UInt32,
