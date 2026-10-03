@@ -1,9 +1,10 @@
 # inverter-climate
 
-Energy-aware climate coordination through **Home Assistant** and
-**inverter-gateway**. Google Nest remains connected through Home Assistant's
-existing integration; this service needs no Google credentials or additional
-Google project.
+Energy-aware climate coordination **on Venus OS**, using local **D-Bus** and
+**Home Assistant**. Google Nest remains connected through Home Assistant's
+existing integration; this package needs no Google credentials or additional
+Google project. A small supervised Python process runs beside the existing
+Venus services, including on Raspberry Pi 3. It makes no D-Bus writes.
 
 The first use case is a gas furnace that consumes approximately **500 W of
 electricity while heating**. Gas supplies the heat; electricity runs the furnace
@@ -11,25 +12,73 @@ and associated equipment. This service can shift useful heating toward measured
 solar export. It does **not** measure gas usage, guarantee financial savings, or
 create a reason to burn additional gas just to consume electricity.
 
-**Version 0.1 starts in observation mode.** It records what it would do without
+**Observation mode is the default.** It records what it would do without
 changing the thermostat. Only explicit `mode = "active"` enables setpoint writes.
 
 ## Connections
 
 ```mermaid
 flowchart LR
-  GX[Victron GX] --> IGW[inverter-gateway /v1/energy]
-  IGW --> Climate[inverter-climate]
+  subgraph Venus[Venus OS / Raspberry Pi]
+    DBus[Local system D-Bus] --> Climate[inverter-climate]
+  end
   Climate <-->|State and temperature setpoint| HA[Home Assistant]
   HA <-->|Existing Nest integration| Google[Google Nest]
   Google <--> Thermostat[Thermostat]
 ```
 
-Run the service on an always-on Linux server/container. It does not require the
-desktop app to be open and does not run its cloud requests on the inverter.
+The native installation needs neither Kubernetes, Docker, inverter-gateway,
+Cloudflare Access nor Node-RED. Network requests run in this separate low-rate
+process, outside the inverter-control loop. HA still provides the Nest cloud
+connection. This is a third-party Venus OS package, not a built-in Nest device
+driver or a new thermostat page in Victron's Remote Console.
 
-## First run
+## Native Venus OS installation
 
+Requires firmware Python 3.12+ and its native `dbus` module. Do not replace the
+firmware Python or install dependencies into its global environment. The build
+bundles the locked pure-Python HTTP dependencies separately; native D-Bus comes
+from Venus OS. Node-RED and Venus OS Large are not required.
+
+Build on your workstation, then transfer the archive and checksum to the device:
+
+```sh
+uv sync --frozen
+bash scripts/build-venus-bundle.sh
+# Transfer dist/inverter-climate-venus.tar.gz and its .sha256 to a staging directory.
+# On the Venus OS device, verify the checksum before extracting:
+sha256sum -c inverter-climate-venus.tar.gz.sha256
+tar -xzf inverter-climate-venus.tar.gz
+python3 -B inverter-climate/deploy/venus/install.py install --bundle inverter-climate
+```
+
+Installation starts disabled. Put your private configuration at
+`/data/setupOptions/inverter-climate/config.toml`, using
+[`examples/venus.toml`](examples/venus.toml) as the starting point. Store just
+`HA_BASE_URL` and `HA_TOKEN` in the adjacent `environment` file (shell `KEY=value`
+syntax, mode `0600`). Select the actual PV paths and all grid phases and retain
+`mode = "observe"`. Then start the native service:
+
+```sh
+python3 -B /data/inverter-climate/deploy/venus/install.py start
+svstat /service/inverter-climate
+cat /run/inverter-climate/status.json
+```
+
+The installer keeps code in `/data/inverter-climate`, private configuration in
+`/data/setupOptions/inverter-climate`, and the durable ownership journal in
+`/data/inverter-climate-state`. A narrowly marked `/data/rc.local` hook restores
+the service symlink after boot; existing boot commands remain intact. Updates
+keep the previous bundle for rollback. See [native lifecycle](deploy/venus/README.md).
+
+Status and bounded logs live in `/run` (RAM). Stable observation does not rewrite
+the durable journal every poll: ownership/manual changes are saved immediately,
+with a one-minute checkpoint while a boost is owned. Surplus must qualify again
+after restart. This reduces background SD-card writes.
+
+## Optional external gateway deployment
+
+The previous external backend remains available for installations that want it.
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
@@ -69,9 +118,15 @@ example to review for your household, not a universal heating recommendation.
    `idle`/`heating` action, no preset, and target-temperature capability qualify.
    `off`, cooling, heat/cool ranges, eco presets, and unavailable devices receive
    no new boost. The service never changes HVAC mode or switches furnace power.
-2. Require fresh schema-v1 gateway readings for solar, grid power, battery power
-   and state of charge. Positive grid power means import; negative means export.
-   Positive battery power means charging. Configure complete sources in the
+2. Require a valid energy observation for solar, grid power, battery power and
+   state of charge. Native mode reads one coherent root snapshot from
+   `com.victronenergy.system`, checking the service owner around the read.
+   Explicit grid phases must match `Ac/Grid/NumberOfPhases`; missing/null selected
+   PV components invalidate the sample. Native freshness means a recent local
+   service read, not proof of the age of a physical measurement. In gateway mode,
+   the existing schema-v1 receipt freshness rules still apply.
+   Positive grid power means import; negative means export.
+   Positive battery power means charging. External deployments use the
    [gateway energy contract](https://github.com/victron-venus/inverter-gateway/blob/main/docs/energy-api.md).
 3. Require at least 600 W of export for 180 seconds by default: 500 W estimated
    furnace draw plus 100 W margin, solar output at least 500 W, battery SoC at
@@ -133,8 +188,10 @@ or powering off the host cannot guarantee immediate restoration. The thermostat
 continues its own current setpoint; restarting active mode reconciles the journal.
 
 The status JSON contains observations, the last decision, and integration health.
-Logs omit endpoint/entity identity and credentials. Keep state/status on private
-persistent storage; do not publish household observations.
+Logs omit endpoint/entity identity and credentials. Keep the journal on private
+persistent storage and status private; on Venus, status belongs in `/run`.
+Do not publish household observations. Native stop/release commands are in the
+[native lifecycle guide](deploy/venus/README.md#stop-restart-and-release).
 
 ## Container and systemd
 
