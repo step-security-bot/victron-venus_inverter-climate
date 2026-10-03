@@ -1,0 +1,40 @@
+#!/bin/bash
+# SetupHelper owns package state; the native installer owns its persistent service.
+# INVERTER_CLIMATE_ROOT is exclusively for offline lifecycle tests.
+climateRoot="$(cd "${INVERTER_CLIMATE_ROOT:-/}" && pwd -P)" || exit 1
+climatePrefix="${climateRoot%/}"
+climatePackageDir="$(cd "$(dirname "$0")" && pwd -P)" || exit 1
+if [ "$climatePackageDir" != "$climatePrefix/data/inverter-climate" ]; then
+    echo "Install the verified package at /data/inverter-climate before running setup." >&2
+    exit 1
+fi
+if [ ! -f "$climatePrefix/data/SetupHelper/HelperResources/IncludeHelpers" ]; then
+    echo "SetupHelper must be installed before setting up inverter-climate." >&2
+    exit 1
+fi
+source "$climatePrefix/data/SetupHelper/HelperResources/IncludeHelpers" || exit $?
+
+if [ "$scriptAction" == 'NONE' ] && ! [ -t 0 ]; then
+    echo "An explicit setup action is required: install, uninstall, or reinstall." >&2
+    exit 1
+fi
+if [ "$scriptAction" == 'NONE' ]; then
+    standardActionPrompt
+fi
+
+if [ "$scriptAction" == 'INSTALL' ]; then
+    logMessage "Installing $packageName"
+    # Do not call endScript after a failed update: that could mark an incomplete
+    # version installed or trigger SetupHelper's failed-install cleanup.
+    sh "$scriptDir/update.sh" || exit $?
+elif [ "$scriptAction" == 'UNINSTALL' ]; then
+    logMessage "Uninstalling $packageName"
+    python3 -B "$scriptDir/payload/deploy/venus/install.py" uninstall \
+        --root "$climateRoot" || exit $?
+fi
+
+# As in dbus-pump, dbus-ev and inverter-control, the service stays under /data.
+# endScript records installedVersion, optionsSet and DO_NOT_AUTO_INSTALL and
+# supports PackageManager and firmware-triggered reinstall without copying
+# a second service definition into the firmware filesystem.
+endScript

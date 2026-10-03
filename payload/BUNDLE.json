@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "python": ">=3.12",
+  "platform": "pure-python",
+  "firmware_dependencies": [
+    "dbus",
+    "dbus.mainloop.glib",
+    "gi.repository.GLib",
+    "velib_python"
+  ]
+}

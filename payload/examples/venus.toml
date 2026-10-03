@@ -1,0 +1,28 @@
+[service]
+entity_id = "climate.example_thermostat"
+mode = "observe"
+poll_seconds = 30
+state_path = "/data/inverter-climate-state/state.json"
+status_path = "/run/inverter-climate/status.json"
+
+[energy]
+backend = "venus"
+# Select actual installed PV components and every grid phase. This is an example.
+solar_paths = ["Dc/Pv/Power", "Ac/PvOnGrid/L1/Power"]
+grid_phases = ["L1", "L2"]
+timeout_seconds = 5
+
+[device]
+enabled = true
+device_instance = 80
+custom_name = "Inverter Climate"
+stale_seconds = 120
+
+[policy]
+comfort_min_c = 17
+comfort_max_c = 19
+boost_delta_c = 0.5
+heating_power_w = 500
+start_margin_w = 100
+start_soc = 90
+stop_soc = 80
