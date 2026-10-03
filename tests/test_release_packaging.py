@@ -95,6 +95,114 @@ def publish(package, tmp_path, existing=None, execute=True, name="checkout"):
     )
 
 
+def test_latest_release_uses_exact_read_only_transport(monkeypatch):
+    calls = []
+
+    def response(arguments, **kwargs):
+        calls.append((arguments, kwargs))
+        return subprocess.CompletedProcess(arguments, 0, b'{"id": 123, "tag_name": "v0.3.0"}', b"")
+
+    monkeypatch.setattr(publisher.subprocess, "run", response)
+    client = publisher.SetupHelperGitHub("victron-venus/inverter-climate")
+    assert client.optional("releases/latest") == {"id": 123, "tag_name": "v0.3.0"}
+    assert calls == [
+        (
+            [
+                "gh",
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "GET",
+                "--",
+                "repos/victron-venus/inverter-climate/releases/latest",
+            ],
+            {"capture_output": True, "check": False},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "path,method,body,mode",
+    [
+        ("releases/latest", "POST", {}, "json"),
+        ("releases/latest", "GET", {}, "json"),
+        ("releases/latest", "GET", None, "pages"),
+        ("releases/latest", "GET", None, "asset"),
+        ("releases/latest?per_page=100", "GET", None, "json"),
+        ("releases/latest/../tags/v0.3.0", "GET", None, "json"),
+    ],
+)
+def test_latest_lookup_cannot_expand_route_or_mutation_permissions(
+    monkeypatch, path, method, body, mode
+):
+    monkeypatch.setattr(
+        publisher.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("Unexpected request")
+    )
+    client = publisher.SetupHelperGitHub("victron-venus/inverter-climate")
+    with pytest.raises(publisher.ReleaseError):
+        client.request(path, method, body, mode)
+
+
+def test_missing_stable_release_skips_through_real_transport(monkeypatch, capsys):
+    calls = []
+
+    def response(arguments, **kwargs):
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 1, b"", b"gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(publisher.subprocess, "run", response)
+    publisher.publish("victron-venus/inverter-climate", "", execute=True)
+    assert len(calls) == 1
+    assert "publication skipped" in capsys.readouterr().out
+
+
+def test_missing_latest_branch_uses_shared_ref_transport(monkeypatch):
+    calls = []
+
+    def response(arguments, **kwargs):
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 1, b"", b"gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(publisher.subprocess, "run", response)
+    client = publisher.SetupHelperGitHub("victron-venus/inverter-climate")
+    assert client.optional("git/ref/heads/latest") is None
+    assert calls == [
+        [
+            "gh",
+            "api",
+            "--hostname",
+            "github.com",
+            "--method",
+            "GET",
+            "--",
+            "repos/victron-venus/inverter-climate/git/ref/heads/latest",
+        ]
+    ]
+
+
+def test_latest_branch_metadata_uses_shared_ref_transport(monkeypatch):
+    body = {"ref": "refs/heads/latest", "object": {"type": "commit", "sha": "a" * 40}}
+
+    def response(arguments, **kwargs):
+        assert arguments[-1] == "repos/victron-venus/inverter-climate/git/ref/heads/latest"
+        return subprocess.CompletedProcess(arguments, 0, json.dumps(body).encode(), b"")
+
+    monkeypatch.setattr(publisher.subprocess, "run", response)
+    client = publisher.SetupHelperGitHub("victron-venus/inverter-climate")
+    assert client.optional("git/ref/heads/latest") == body
+
+
+def test_latest_lookup_does_not_hide_permissions_failure(monkeypatch):
+    def response(arguments, **kwargs):
+        return subprocess.CompletedProcess(arguments, 1, b"", b"gh: Forbidden (HTTP 403)")
+
+    monkeypatch.setattr(publisher.subprocess, "run", response)
+    client = publisher.SetupHelperGitHub("victron-venus/inverter-climate")
+    with pytest.raises(publisher.ReleaseError, match="HTTP 403"):
+        client.optional("releases/latest")
+
+
 @pytest.mark.parametrize("value", ["0.3.0", "v0.3.0-rc.1", "v01.3.0", "v1.٣.0", "v1.2.3\n"])
 def test_only_canonical_stable_versions_can_publish(value):
     with pytest.raises(publisher.ReleaseError):
@@ -197,7 +305,7 @@ def test_publication_requires_shared_stable_verification_before_git(tmp_path, mo
         assert tag == "v0.3.0" and directory.is_dir()
         raise publisher.ReleaseError("Source evidence rejected")
 
-    monkeypatch.setattr(publisher, "GitHub", Releases)
+    monkeypatch.setattr(publisher, "SetupHelperGitHub", Releases)
     monkeypatch.setattr(publisher, "verified_assets", failed_evidence)
     monkeypatch.setattr(publisher, "git", lambda *_args, **_kw: pytest.fail("Unexpected Git write"))
     with pytest.raises(publisher.ReleaseError, match="evidence rejected"):

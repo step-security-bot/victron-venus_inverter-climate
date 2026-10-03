@@ -27,6 +27,27 @@ BRANCH = "latest"
 PACKAGE = "inverter-climate"
 
 
+class SetupHelperGitHub(GitHub):
+    """Add only the stable-channel lookup to the shared provenance transport."""
+
+    def request(self, path: str, method="GET", body=None, mode="json") -> bytes:
+        if path != "releases/latest":
+            return super().request(path, method, body, mode)
+        require(
+            method == "GET" and body is None and mode == "json",
+            "Latest stable release lookup is read-only JSON",
+        )
+        endpoint = f"{self.base}/releases/latest"
+        return self.response(
+            subprocess.run(
+                ["gh", "api", "--hostname", "github.com", "--method", "GET", "--", endpoint],
+                capture_output=True,
+                check=False,
+            ),
+            f"GET {endpoint}",
+        )
+
+
 def version_tuple(value: str) -> tuple[int, int, int]:
     require(
         bool(re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", value)),
@@ -166,7 +187,7 @@ def publish_tree(
 
 
 def publish(repository: str, requested_tag: str, *, execute: bool):
-    gh = GitHub(repository)
+    gh = SetupHelperGitHub(repository)
     latest = gh.optional("releases/latest")
     if latest is None and not requested_tag:
         print("No stable release is available; SetupHelper publication skipped")
