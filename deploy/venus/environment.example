@@ -1,0 +1,3 @@
+# Shell assignments; quote values when necessary. Keep the real file private.
+HA_BASE_URL=http://homeassistant.example:8123
+HA_TOKEN=replace-locally
