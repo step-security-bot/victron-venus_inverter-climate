@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+umask 077
+mkdir -p /run/inverter-climate/log
+exec multilog t s65536 n2 /run/inverter-climate/log
