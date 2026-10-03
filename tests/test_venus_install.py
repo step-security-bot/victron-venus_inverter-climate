@@ -263,6 +263,10 @@ def test_live_update_checks_firmware_then_stops_before_replacing_bundle(
     native.install(make_bundle(tmp_path / "second", "second"), False)
     assert commands[0][1:4] == ["-I", "-B", "-c"]
     assert "import sys, dbus, tomllib" in commands[0][4]
+    assert "import dbus.mainloop.glib" in commands[0][4]
+    assert "from gi.repository import GLib" in commands[0][4]
+    assert "import vedbus, settingsdevice" in commands[0][4]
+    assert commands[0][-1] == "/opt/victronenergy/dbus-systemcalc-py/ext/velib_python"
     assert [(command[0], command[1]) for command in commands[1:]] == [
         ("svc", "-d"),
         ("svstat", str(native.link)),
@@ -455,3 +459,100 @@ def test_ambiguous_rollback_preserves_every_copy_without_stopping(setup, tmp_pat
     assert (
         native.current.is_dir() and native.previous.is_dir() and native.rollback_temporary.is_dir()
     )
+
+
+def legacy_install(native, bundle, enabled=False):
+    """Represent the released 0.2 layout without executing its old installer."""
+    shutil.copytree(bundle, native.legacy)
+    run = native.legacy / "deploy/venus/run"
+    run.write_text(run.read_text().replace(installer.RUNTIME, "/data/inverter-climate"))
+    manifest(native.legacy)
+    native.definition.mkdir(parents=True)
+    (native.definition / ".owner").write_text(installer.MARKER)
+    (native.definition / "run").write_text(run.read_text())
+    if not enabled:
+        (native.definition / "down").touch()
+    native.link.parent.mkdir(parents=True)
+    native.link.symlink_to(native.definition)
+    native.rc.write_text(
+        "#!/bin/sh\n" + installer.BOOT.replace(installer.RUNTIME, "/data/inverter-climate")
+    )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_legacy_migration_then_package_replacement_update_and_rollback(setup, tmp_path, enabled):
+    native, legacy = setup
+    configure(native)
+    legacy_install(native, legacy, enabled=enabled)
+    original = (native.legacy / "SHA256SUMS").read_bytes()
+    private = (native.options / "environment").read_bytes()
+    native.migrate()
+    native.migrate()
+    assert (native.legacy / "SHA256SUMS").read_bytes() == original
+    assert (native.current / "SHA256SUMS").read_bytes() == original
+    assert installer.RUNTIME in (native.definition / "run").read_text()
+    assert "cd /data/inverter-climate\n" not in (native.definition / "run").read_text()
+    assert installer.BOOT in native.rc.read_text()
+    assert (native.definition / "down").exists() is not enabled
+    # PackageManager may now replace the complete source directory safely.
+    shutil.rmtree(native.legacy)
+    native.legacy.mkdir()
+    candidate = make_bundle(tmp_path / "candidate", "new-package")
+    native.install(candidate, False)
+    assert (native.previous / "SHA256SUMS").read_bytes() == original
+    native.rollback()
+    assert (native.current / "SHA256SUMS").read_bytes() == original
+    assert installer.RUNTIME in (native.definition / "run").read_text()
+    assert (native.definition / "down").exists() is not enabled
+    assert (native.options / "environment").read_bytes() == private
+
+
+def test_legacy_migration_failed_copy_does_not_stop_or_modify_old_service(setup, monkeypatch):
+    native, bundle = setup
+    legacy_install(native, bundle)
+    before = native.rc.read_bytes()
+    monkeypatch.setattr(native, "stop", lambda: pytest.fail("migration stopped early"))
+
+    def fail(source, destination):
+        raise OSError("injected migration promotion failure")
+
+    monkeypatch.setattr(installer, "move_bundle", fail)
+    with pytest.raises(OSError):
+        native.migrate()
+    assert not native.current.exists()
+    assert native.rc.read_bytes() == before
+    installer.validate_bundle(native.legacy)
+
+
+def test_install_from_staging_automatically_retains_existing_legacy_bundle(setup, tmp_path):
+    native, bundle = setup
+    legacy_install(native, bundle)
+    original = (native.legacy / "SHA256SUMS").read_bytes()
+    native.install(make_bundle(tmp_path / "candidate", "new-package"), False)
+    assert (native.legacy / "SHA256SUMS").read_bytes() == original
+    assert (native.previous / "SHA256SUMS").read_bytes() == original
+    assert "new-package" in (native.current / "src/inverter_climate/service.py").read_text()
+
+
+def test_migration_without_owned_legacy_service_refuses_to_adopt_source(setup):
+    native, bundle = setup
+    shutil.copytree(bundle, native.legacy)
+    with pytest.raises(ValueError, match="owned legacy"):
+        native.migrate()
+    assert not native.current.exists()
+
+
+def test_same_payload_reinstall_retains_previous_version_without_stopping(
+    setup, tmp_path, monkeypatch
+):
+    native, first = setup
+    native.install(first, False)
+    second = make_bundle(tmp_path / "second", "second")
+    native.install(second, False)
+    original_inode = native.current.stat().st_ino
+    monkeypatch.setattr(native, "stop", lambda: pytest.fail("identical reinstall stopped service"))
+    native.link.unlink()
+    native.install(second, False)
+    assert native.current.stat().st_ino == original_inode
+    assert native.link.is_symlink()
+    assert "first" in (native.previous / "src/inverter_climate/service.py").read_text()

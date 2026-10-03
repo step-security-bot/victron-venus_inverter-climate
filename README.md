@@ -30,51 +30,62 @@ flowchart LR
 The native installation needs neither Kubernetes, Docker, inverter-gateway,
 Cloudflare Access nor Node-RED. Network requests run in this separate low-rate
 process, outside the inverter-control loop. HA still provides the Nest cloud
-connection. This is a third-party Venus OS package, not a built-in Nest device
-driver or a new thermostat page in Victron's Remote Console.
+connection. This third-party Venus OS package publishes a temperature device in Remote
+Console; HA owns the Nest protocol and authentication.
 
 ## Native Venus OS installation
 
-Requires firmware Python 3.12+ and its native `dbus` module. Do not replace the
-firmware Python or install dependencies into its global environment. The build
-bundles the locked pure-Python HTTP dependencies separately; native D-Bus comes
-from Venus OS. Node-RED and Venus OS Large are not required.
+Install through SetupHelper/PackageManager: package **inverter-climate**, GitHub
+user **victron-venus**, branch **latest**. This branch contains the verified
+stable package with its locked pure-Python dependencies. The development `main`
+branch is source code. Firmware provides Python 3.12+, D-Bus, GLib and
+`velib_python`; no global Python installation or firmware replacement is needed.
 
-Build on your workstation, then transfer the archive and checksum to the device:
-
-```sh
-uv sync --frozen
-bash scripts/build-venus-bundle.sh
-# Transfer dist/inverter-climate-venus.tar.gz and its .sha256 to a staging directory.
-# On the Venus OS device, verify the checksum before extracting:
-sha256sum -c inverter-climate-venus.tar.gz.sha256
-tar -xzf inverter-climate-venus.tar.gz
-python3 -B inverter-climate/deploy/venus/install.py install --bundle inverter-climate
-```
-
-Installation starts disabled. Put your private configuration at
-`/data/setupOptions/inverter-climate/config.toml`, using
-[`examples/venus.toml`](examples/venus.toml) as the starting point. Store just
-`HA_BASE_URL` and `HA_TOKEN` in the adjacent `environment` file (shell `KEY=value`
-syntax, mode `0600`). Select the actual PV paths and all grid phases and retain
-`mode = "observe"`. Then start the native service:
+A first installation stays disabled until configured. Put private `config.toml`
+and `environment` files under `/data/setupOptions/inverter-climate`, readable
+only by root. Use [`examples/venus.toml`](examples/venus.toml), select your actual
+HA entity, complete PV paths and grid phases, and retain `mode = "observe"`.
+The environment contains only `HA_BASE_URL` and `HA_TOKEN`.
 
 ```sh
-python3 -B /data/inverter-climate/deploy/venus/install.py start
+python3 -B /data/inverter-climate/payload/deploy/venus/install.py start
 svstat /service/inverter-climate
 cat /run/inverter-climate/status.json
 ```
 
-The installer keeps code in `/data/inverter-climate`, private configuration in
-`/data/setupOptions/inverter-climate`, and the durable ownership journal in
-`/data/inverter-climate-state`. A narrowly marked `/data/rc.local` hook restores
-the service symlink after boot; existing boot commands remain intact. Updates
-keep the previous bundle for rollback. See [native lifecycle](deploy/venus/README.md).
-
+PackageManager owns the source package at `/data/inverter-climate`; the running
+payload and previous version are isolated under `/data/inverter-climate-runtime`.
+Private configuration and the ownership journal survive package replacement.
 Status and bounded logs live in `/run` (RAM). Stable observation does not rewrite
-the durable journal every poll: ownership/manual changes are saved immediately,
-with a one-minute checkpoint while a boost is owned. Surplus must qualify again
-after restart. This reduces background SD-card writes.
+the journal every poll; ownership and command changes remain immediately durable.
+
+See the [SetupHelper lifecycle guide](deploy/venus/README.md) for archive
+installation, updating, uninstalling, rollback and **migration from the original
+0.2 native installation**. Migrate that installation before PackageManager
+replaces its old source directory.
+
+## Device list and D-Bus publication
+
+The native daemon publishes **Inverter Climate** as a supported Venus temperature
+device, with `TemperatureType = 3` (Room). The stock GUI shows the thermostat's
+measured room temperature and device metadata. It does not provide a custom
+thermostat control panel. HA continues to provide the Nest connection.
+
+The service name is `com.victronenergy.temperature.inverter_climate_<identity>`.
+The suffix is a stable hash, not the private HA address or entity name. Local
+settings persist the device instance and custom display name across upgrades.
+Only the custom name is writable; telemetry cannot change the thermostat.
+
+The supported `/Temperature` path is in degrees Celsius. Read-only `/Climate/*`
+extensions describe the target, HVAC mode/action, coordination state and
+integration health. `/Climate/EstimatedHeatingPower` explicitly identifies the
+500 W policy estimate. The device publishes no AC/DC power or energy counters,
+so it cannot add that estimate to measured household consumption.
+
+One dedicated GLib worker serves GUI requests and emits batched changes while
+HA requests run outside that event loop. Energy uses a separate persistent bus
+connection and one root system snapshot per observation, with service-owner
+checks around the read. No D-Bus subprocess is launched in the polling path.
 
 ## Optional external gateway deployment
 
@@ -214,6 +225,11 @@ control transitions, manual changes, restart journals, and uncertain command
 outcomes. CI runs on Python 3.12 and 3.13. Public source contains example
 identifiers only; tokens and household configuration belong outside Git.
 
+CI and release publication use the shared `venus-os-ci-toolkit` conventions.
+Renovate uses the organization preset and central repository registry.
+See [release workflow](docs/release-workflow.md) for checked candidates, protected
+stable promotion, and the verified SetupHelper package branch.
+
 Repository infrastructure is owned by the isolated
 `terraform-github-4alvit/stacks/inverter-climate-repository` Terraform stack.
 
@@ -222,6 +238,8 @@ Repository infrastructure is owned by the isolated
 - [Home Assistant REST API](https://developers.home-assistant.io/docs/api/rest/)
 - [Home Assistant climate](https://www.home-assistant.io/integrations/climate/)
 - [Google Nest integration](https://www.home-assistant.io/integrations/nest/)
+- [Victron D-Bus API](https://github.com/victronenergy/venus/wiki/dbus-api)
+- [Victron D-Bus paths](https://github.com/victronenergy/venus/wiki/dbus)
 - [Victron GX Opportunity Loads](https://www.victronenergy.com/media/pg/Cerbo_GX/en/gx-opportunity-loads.html)
 
-This is an independent integration, not a native Victron Nest driver.
+This is an independent integration using the documented Venus D-Bus interface.

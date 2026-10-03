@@ -50,6 +50,20 @@ def make_energy_client(config: Config) -> EnergyClient:
     )
 
 
+def make_device_publisher(config: Config, binding: str):
+    if config.energy.backend != "venus" or not config.device.enabled:
+        return None
+    from .dbus_device import DbusDevicePublisher
+
+    return DbusDevicePublisher(
+        identity=binding,
+        device_instance=config.device.device_instance,
+        custom_name=config.device.custom_name,
+        stale_seconds=config.device.stale_seconds,
+        firmware_version=__version__,
+    )
+
+
 def journal_signature(state) -> dict:
     # Poll timestamps and surplus qualification are transient. Restarting always
     # requalifies surplus, so stable observation needs no recurring SD-card writes.
@@ -191,7 +205,7 @@ def main() -> int:
         help="release an owned boost; active mode required to write",
     )
     args = parser.parse_args()
-    ha = gateway = None
+    ha = gateway = publisher = None
     try:
         ha_url = required_env("HA_BASE_URL")
         ha = HomeAssistantClient(ha_url, required_env("HA_TOKEN"))
@@ -207,9 +221,20 @@ def main() -> int:
         for signum in (signal.SIGINT, signal.SIGTERM):
             signal.signal(signum, lambda *_: stop.set())
         with process_lock(config.state_path):
-            service = Service(config, ha, gateway, identity(ha_url, config.entity_id))
+            binding = identity(ha_url, config.entity_id)
+            service = Service(config, ha, gateway, binding)
+            # Foreground discovery/release checks must remain usable without a
+            # publishing bus, and one-shot probes should not churn GUI devices.
+            if not args.once and not args.release:
+                publisher = make_device_publisher(config, binding)
+                if publisher is not None:
+                    publisher.start()
             while not stop.is_set():
+                if publisher is not None:
+                    publisher.check_health()
                 result = service.tick(release=args.release)
+                if publisher is not None:
+                    publisher.publish(result)
                 # Logs omit entity identity, endpoints and credentials.
                 print(
                     json.dumps(
@@ -233,6 +258,8 @@ def main() -> int:
         )
         return 2
     finally:
+        if publisher is not None:
+            publisher.close()
         if gateway is not None:
             gateway.close()
         if ha is not None:

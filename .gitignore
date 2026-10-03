@@ -13,3 +13,9 @@ status*.json
 *.lockfile
 private/
 logs/
+
+release-dist/
+release-assets/
+.release-*/
+.release-plan.json
+.release-inputs.json

@@ -1,0 +1,53 @@
+name: Build Release Candidate
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      channel:
+        required: true
+        type: string
+      release_plan_artifact:
+        description: Frozen version plan allocated by the shared release pipeline
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: 0.12.7
+      - name: Download frozen release version plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.release_plan_artifact }}
+          path: .
+      - name: Apply frozen version inputs
+        run: python3 scripts/version_plan.py sync --root . --plan .release-plan.json
+      - name: Build complete native and Python assets
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+        run: bash scripts/package-release.sh "$RELEASE_VERSION" "$RELEASE_CHANNEL"
+      - name: Verify packaged checksums
+        working-directory: release-dist
+        run: sha256sum --check SHA256SUMS
+      - name: Verify versioned assets and create build receipt
+        run: python3 scripts/stage_release_assets.py --target package --pattern 'release-dist/*'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: release-assets/package/*
+          if-no-files-found: error
+          retention-days: 90

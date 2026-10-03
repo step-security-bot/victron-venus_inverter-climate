@@ -1,0 +1,14 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["local>victron-venus/venus-os-ci-toolkit:renovate-ci"],
+  "enabledManagers": ["github-actions", "custom.regex", "pep621", "dockerfile"],
+  "lockFileMaintenance": {"enabled": true},
+  "packageRules": [
+    {
+      "matchManagers": ["pep621"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Python dependencies"
+    },
+    {"matchManagers": ["dockerfile"], "pinDigests": true}
+  ]
+}
