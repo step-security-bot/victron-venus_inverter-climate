@@ -224,6 +224,19 @@ class HomeAssistantClient(_JsonClient):
         if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
             raise IntegrationError("Home Assistant returned an invalid service response.")
 
+    def set_hvac_mode(self, entity_id: str, mode: str) -> None:
+        """Request one explicit Heat/Off change; never infer a toggle or retry."""
+        entity_id = _entity_id(entity_id)
+        if not isinstance(mode, str) or mode not in ("heat", "off"):
+            raise IntegrationError("HVAC mode must be heat or off.")
+        result = self._request(
+            "POST",
+            "api/services/climate/set_hvac_mode",
+            body={"entity_id": entity_id, "hvac_mode": mode},
+        )
+        if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
+            raise IntegrationError("Home Assistant returned an invalid service response.")
+
 
 class GatewayClient(_JsonClient):
     def __init__(

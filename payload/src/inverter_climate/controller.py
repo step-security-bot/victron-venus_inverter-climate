@@ -68,6 +68,9 @@ def evaluate(
     if climate is None:
         state.surplus_since = None
         return Decision("wait", "thermostat_unavailable")
+    if climate.mode == "heat" and climate.target_c is None:
+        state.surplus_since = None
+        return Decision("wait", "thermostat_target_unavailable")
 
     prior_target = state.observed_target_c
     prior_mode = state.observed_mode
@@ -146,10 +149,11 @@ def evaluate(
             return Decision("would_restore", reason, baseline)
         return Decision("wait", "boost_running")
 
-    if prior_target is not None and (
-        not same(prior_target, climate.target_c)
-        or prior_mode != climate.mode
-        or prior_preset != climate.preset
+    targets_match = (prior_target is None and climate.target_c is None) or same(
+        prior_target, climate.target_c
+    )
+    if prior_mode is not None and (
+        not targets_match or prior_mode != climate.mode or prior_preset != climate.preset
     ):
         relinquish(state, now, policy)
         return Decision("wait", "external_change_respected")

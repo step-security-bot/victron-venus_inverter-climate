@@ -4,7 +4,8 @@ Energy-aware climate coordination **on Venus OS**, using local **D-Bus** and
 **Home Assistant**. Google Nest remains connected through Home Assistant's
 existing integration; this package needs no Google credentials or additional
 Google project. A small supervised Python process runs beside the existing
-Venus services, including on Raspberry Pi 3. It makes no D-Bus writes.
+Venus services, including on Raspberry Pi 3. It reads system energy over D-Bus
+and exposes optional native thermostat controls.
 
 The first use case is a gas furnace that consumes approximately **500 W of
 electricity while heating**. Gas supplies the heat; electricity runs the furnace
@@ -12,8 +13,10 @@ and associated equipment. This service can shift useful heating toward measured
 solar export. It does **not** measure gas usage, guarantee financial savings, or
 create a reason to burn additional gas just to consume electricity.
 
-**Observation mode is the default.** It records what it would do without
-changing the thermostat. Only explicit `mode = "active"` enables setpoint writes.
+**Observation mode is the default.** Automatic preheating only writes when
+`mode = "active"`. Separately, `[device] control_enabled = true` enables explicit
+user commands from the native Switch pane. Both forms of control are disabled
+by default; enabling manual controls does not enable automatic preheating.
 
 ## Connections
 
@@ -21,6 +24,7 @@ changing the thermostat. Only explicit `mode = "active"` enables setpoint writes
 flowchart LR
   subgraph Venus[Venus OS / Raspberry Pi]
     DBus[Local system D-Bus] --> Climate[inverter-climate]
+    GUI[GUI v2 / VRM Remote Console] -->|Manual controls| Climate
   end
   Climate <-->|State and temperature setpoint| HA[Home Assistant]
   HA <-->|Existing Nest integration| Google[Google Nest]
@@ -68,13 +72,32 @@ replaces its old source directory.
 
 The native daemon publishes **Inverter Climate** as a supported Venus temperature
 device, with `TemperatureType = 3` (Room). The stock GUI shows the thermostat's
-measured room temperature and device metadata. It does not provide a custom
-thermostat control panel. HA continues to provide the Nest connection.
+measured room temperature and device metadata. Its standard **Switch pane** can
+also display a temperature slider and a **Heating mode** dropdown (`Off` / `Heat`).
+These controls use Victron's Switchable Output API on the same temperature
+service and work through GUI v2 and VRM Remote Console without GUI patches.
+HA continues to provide the Nest connection.
 
 The service name is `com.victronenergy.temperature.inverter_climate_<identity>`.
 The suffix is a stable hash, not the private HA address or entity name. Local
 settings persist the device instance and custom display name across upgrades.
-Only the custom name is writable; telemetry cannot change the thermostat.
+The custom name and the explicitly enabled Switch pane controls are writable;
+temperature and climate telemetry remain read-only. Upgrading does not enable
+controls or change the device identity or its temperature history.
+
+To enable manual controls, add `control_enabled = true` to the existing
+`[device]` section of the private native configuration and restart the service.
+Keep `mode = "observe"` when only manual control is wanted. GUI v2 1.2.40 provides
+the supported controls; the classic GUI has no equivalent Switch pane.
+
+The slider uses the thermostat's advertised limits and temperature step, with
+automatic conversion between Celsius and Fahrenheit. `Off` hides the slider
+when Nest has no target temperature, while the mode dropdown remains available
+to select `Heat`. Manual requests run serially outside the D-Bus thread. D-Bus readback remains
+the last HA observation; the stock GUI may briefly show a requested value while
+waiting, which is not confirmation. Pending,
+stale or unsupported controls are unavailable. The temperature device remains
+visible while the thermostat is off.
 
 The supported `/Temperature` path is in degrees Celsius. Read-only `/Climate/*`
 extensions describe the target, HVAC mode/action, coordination state and
@@ -128,7 +151,8 @@ example to review for your household, not a universal heating recommendation.
 1. Respect the existing thermostat target as the baseline. Only `heat` mode,
    `idle`/`heating` action, no preset, and target-temperature capability qualify.
    `off`, cooling, heat/cool ranges, eco presets, and unavailable devices receive
-   no new boost. The service never changes HVAC mode or switches furnace power.
+   no new boost. The automatic policy never changes HVAC mode or switches furnace
+   power. Explicit Switch pane commands can select `Heat` or `Off` through HA.
 2. Require a valid energy observation for solar, grid power, battery power and
    state of charge. Native mode reads one coherent root snapshot from
    `com.victronenergy.system`, checking the service owner around the read.
@@ -163,6 +187,14 @@ even when additional solar generation could be available. These are deliberate
 limits for initial observation, to be improved with measured evidence.
 
 ## Commands and recovery
+
+Explicit Switch pane commands have a separate identity-bound journal beside the
+ownership journal (`state.json.manual` with the default native paths). Only one
+command is sent at a time. A manual request relinquishes a confirmed automatic
+boost and starts the configured manual hold. An unresolved automatic command
+temporarily blocks manual commands. An unresolved manual command blocks further
+commands and automation across restarts, including when manual control has been
+disabled. Fresh observations resolve its outcome; restarting never resends it.
 
 Before a service call, re-read the thermostat and persist the exact command
 intent atomically. A later observed setpoint confirms the command. A timeout or

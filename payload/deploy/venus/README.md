@@ -125,6 +125,32 @@ and an empty `errors` array. Review measurement signs and sources against local
 system readings. Status contains private household data. Successful observation
 does not enable thermostat control.
 
+## Optional native manual controls
+
+GUI v2's Switch pane supports a temperature slider and a Heating mode dropdown
+(`Off` / `Heat`) for this package. The same controls are accessible through VRM
+Remote Console. They use the existing Home Assistant integration and need no
+Node-RED service or GUI modification.
+
+In the private `config.toml`, add `control_enabled = true` to the existing
+`[device]` section. Keep `[service] mode = "observe"` to leave automatic
+preheating disabled. Configuration is loaded on startup, so restart the running
+service with `svc -t /service/inverter-climate`. Verify fresh healthy status and
+the controls in Switch pane before changing a setting. Installation and updates
+preserve this explicit choice; new installations keep controls disabled.
+
+D-Bus target and mode readback contain confirmed HA observations. A queued
+request does not immediately change them. The stock GUI can briefly show a
+requested value while waiting; that preview is not a thermostat confirmation. Commands are validated again against
+fresh HA state and persisted before sending. An uncertain outcome is never
+automatically retried. When Nest is off and supplies no target temperature, the
+slider is hidden and the Heating mode dropdown remains available.
+
+Before rolling back to version 0.3, disable manual controls and remove the
+`control_enabled` configuration key, which that version does not recognize.
+Keep the manual-command journal for diagnosis, and do not roll back while a
+command outcome is uncertain. Automatic policy mode should remain `observe`.
+
 ## Files and persistence
 
 - `/data/inverter-climate`: PackageManager source package and lifecycle entrypoints.
@@ -132,7 +158,8 @@ does not enable thermostat control.
 - `/data/inverter-climate-runtime/previous`: preceding payload for rollback.
 - `/data/setupOptions/inverter-climate`: private configuration, SetupHelper options
   and persistent service definition.
-- `/data/inverter-climate-state`: durable ownership journal and process lock.
+- `/data/inverter-climate-state`: durable ownership journal, separate
+  `state.json.manual` command journal and process lock.
 - `/run/inverter-climate`: status and bounded logs in RAM.
 - `/service/inverter-climate`: supervisor link restored by its marked
   `/data/rc.local` hook after boot.

@@ -14,6 +14,8 @@ timeout_seconds = 5
 
 [device]
 enabled = true
+# Explicit user commands in Switch pane; independent of automatic policy mode.
+control_enabled = false
 device_instance = 80
 custom_name = "Inverter Climate"
 stale_seconds = 120

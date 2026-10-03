@@ -1,8 +1,8 @@
 """Publish HA room temperature as a supported Venus OS temperature device.
 
-Only the descriptive CustomName is writable. Thermostat state and policy are
-read-only extension paths, and estimated electrical load is never presented as
-measured AC power. Firmware velib_python owns D-Bus encoding and batch signals.
+Optional switch controls enqueue validated thermostat requests without changing
+observed telemetry. Estimated electrical load is never presented as measured AC
+power. Firmware velib_python owns D-Bus encoding and batch signals.
 """
 
 from __future__ import annotations
@@ -23,11 +23,20 @@ from .clients import IntegrationError
 
 _VELIB = Path("/opt/victronenergy/dbus-systemcalc-py/ext/velib_python")
 _TOKEN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_TEMPERATURE = "/SwitchableOutput/0"
+_MODE = "/SwitchableOutput/1"
+_HVAC_MODE = "/Climate/HvacMode"
+_CONTROL_ENABLED = "/Climate/ControlEnabled"
+_CONTROL_AVAILABLE = "/Climate/ControlAvailable"
+_CONTROL_PENDING = "/Climate/ControlPending"
+_CONTROL_OUTCOME = "/Climate/ControlOutcome"
+_CONTROL_REASON = "/Climate/ControlReason"
+_DISABLED = 0x20
 _EMPTY = {
     "/Connected": 0,
     "/Temperature": None,
     "/Climate/TargetTemperature": None,
-    "/Climate/HvacMode": "unknown",
+    _HVAC_MODE: "unknown",
     "/Climate/HvacAction": "unknown",
     "/Climate/ServiceMode": "unknown",
     "/Climate/Phase": "unknown",
@@ -36,7 +45,25 @@ _EMPTY = {
     "/Climate/EstimatedHeatingPower": None,
     "/Climate/IntegrationHealthy": 0,
     "/Climate/LastUpdate": None,
+    _CONTROL_ENABLED: 0,
+    _CONTROL_AVAILABLE: 0,
+    _CONTROL_PENDING: 0,
+    _CONTROL_OUTCOME: "idle",
+    _CONTROL_REASON: "disabled",
+    f"{_TEMPERATURE}/Dimming": None,
+    f"{_TEMPERATURE}/Measurement": None,
+    f"{_TEMPERATURE}/Status": _DISABLED,
+    f"{_TEMPERATURE}/Settings/DimmingMin": None,
+    f"{_TEMPERATURE}/Settings/DimmingMax": None,
+    f"{_TEMPERATURE}/Settings/StepSize": 0.5,
+    f"{_MODE}/Dimming": None,
+    f"{_MODE}/Status": _DISABLED,
 }
+_CONTROL_KEYS = tuple(
+    path
+    for path in _EMPTY
+    if path.startswith("/Climate/Control") or path.endswith("/Status") or "/Settings/" in path
+)
 
 
 def _number(value: Any, minimum: float, maximum: float) -> float | None:
@@ -69,20 +96,20 @@ def _instance(value: Any) -> int | None:
     return None
 
 
-def _snapshot(status: Mapping) -> dict:
+def _snapshot(status: Mapping, *, commands_supported: bool = False) -> dict:
     """Copy only the defined public telemetry, never entities, errors or URLs."""
     values = dict(_EMPTY)
     climate = status.get("climate")
     if isinstance(climate, Mapping):
         current = _number(climate.get("current_c"), -100, 100)
         target = _number(climate.get("target_c"), -100, 100)
-        if current is not None and target is not None:
+        if current is not None:
             values.update(
                 {
                     "/Connected": 1,
                     "/Temperature": current,
                     "/Climate/TargetTemperature": target,
-                    "/Climate/HvacMode": _token(climate.get("mode")),
+                    _HVAC_MODE: _token(climate.get("mode")),
                     "/Climate/HvacAction": _token(climate.get("action")),
                 }
             )
@@ -100,7 +127,122 @@ def _snapshot(status: Mapping) -> dict:
     values["/Climate/IntegrationHealthy"] = int(
         values["/Connected"] == 1 and status.get("errors") == []
     )
+    _control_snapshot(status.get("control"), values, commands_supported)
     return values
+
+
+def _control_snapshot(control, values, commands_supported):
+    """Advertise observed values and only capabilities backed by the broker."""
+    mode = values[_HVAC_MODE]
+    if values["/Connected"]:
+        values[f"{_TEMPERATURE}/Measurement"] = values["/Temperature"]
+        if mode == "heat":
+            values[f"{_TEMPERATURE}/Dimming"] = values["/Climate/TargetTemperature"]
+        values[f"{_MODE}/Dimming"] = {"off": 0, "heat": 1}.get(mode)
+    if not commands_supported or not isinstance(control, Mapping):
+        return
+    enabled = control.get("enabled") is True
+    available = enabled and control.get("available") is True and bool(values["/Connected"])
+    values[_CONTROL_ENABLED] = int(enabled)
+    values[_CONTROL_AVAILABLE] = int(available)
+    values[_CONTROL_PENDING] = int(control.get("pending") is True)
+    outcome = control.get("outcome")
+    if outcome in ("idle", "queued", "pending", "confirmed", "rejected", "unconfirmed"):
+        values[_CONTROL_OUTCOME] = outcome
+    values[_CONTROL_REASON] = _token(control.get("reason"))
+    minimum = _number(control.get("min_c"), -100, 100)
+    maximum = _number(control.get("max_c"), -100, 100)
+    step = _number(control.get("step_c"), 0, 5)
+    if minimum is not None and maximum is not None and minimum < maximum and step:
+        values[f"{_TEMPERATURE}/Settings/DimmingMin"] = minimum
+        values[f"{_TEMPERATURE}/Settings/DimmingMax"] = maximum
+        values[f"{_TEMPERATURE}/Settings/StepSize"] = step
+        if (
+            available
+            and control.get("can_set_temperature") is True
+            and values[f"{_TEMPERATURE}/Dimming"] is not None
+        ):
+            values[f"{_TEMPERATURE}/Status"] = 0x09
+    supported = control.get("supported_modes")
+    if (
+        available
+        and control.get("can_set_mode") is True
+        and isinstance(supported, (tuple, list))
+        and "heat" in supported
+        and "off" in supported
+        and values[f"{_MODE}/Dimming"] is not None
+    ):
+        values[f"{_MODE}/Status"] = 0x09
+
+
+def _command_item_type(base, method, unwrap):
+    """Keep velib read/notification behavior, but make SetValue a request only.
+
+    Standard velib SetValue both skips callbacks for equal values and echoes an
+    accepted request into telemetry. Neither behavior is valid for HA commands.
+    """
+
+    class CommandItem(base):
+        @method("com.victronenergy.BusItem", in_signature="v", out_signature="i")
+        def SetValue(self, newvalue):
+            if not self._writeable or self._onchangecallback is None:
+                return 1
+            try:
+                accepted = self._onchangecallback(self._path, unwrap(newvalue))
+            except Exception:
+                return 2
+            return 0 if accepted is True else 2
+
+    return CommandItem
+
+
+class _TemperatureUnit:
+    """One read-only subscription to the shared GUI temperature preference."""
+
+    def __init__(self, bus, item_factory, callback):
+        self.bus, self.item_factory, self.callback = bus, item_factory, callback
+        self.item = None
+        self.value = None
+        self.match = bus.add_signal_receiver(
+            self._owner_changed,
+            signal_name="NameOwnerChanged",
+            dbus_interface="org.freedesktop.DBus",
+            bus_name="org.freedesktop.DBus",
+            arg0="com.victronenergy.settings",
+        )
+        self._connect()
+
+    def _connect(self):
+        if self.item is not None:
+            self.item.__del__()
+            self.item = None
+        try:
+            self.item = self.item_factory(
+                self.bus,
+                "com.victronenergy.settings",
+                "/Settings/System/Units/Temperature",
+                eventCallback=self._changed,
+            )
+            self.value = self.item.get_value()
+        except Exception:
+            self.value = None
+
+    def _changed(self, _service, _path, changes):
+        self.value = changes.get("Value")
+        self.callback(self.value)
+
+    def _owner_changed(self, _name, _old, new):
+        if new:
+            self._connect()
+        else:
+            self.value = None
+        self.callback(self.value)
+
+    def close(self):
+        self.match.remove()
+        if self.item is not None:
+            self.item.__del__()
+            self.item = None
 
 
 def _firmware_version(version: str) -> str:
@@ -132,23 +274,54 @@ def _runtime():
     mainloop = importlib.import_module("dbus.mainloop.glib")
     loop = mainloop.DBusGMainLoop()
     glib = importlib.import_module("gi.repository.GLib")
-    service_factory = importlib.import_module("vedbus").VeDbusService
+    vedbus = importlib.import_module("vedbus")
+    service_factory = vedbus.VeDbusService
+    command_item = _command_item_type(
+        vedbus.VeDbusItemExport,
+        importlib.import_module("dbus.service").method,
+        vedbus.unwrap_dbus_value,
+    )
     settings_factory = importlib.import_module("settingsdevice").SettingsDevice
     # Do not change the global default: the energy reader has its own private,
     # synchronous connection and must not be dispatched by this worker's loop.
     bus = dbus.SystemBus(private=True, mainloop=loop)
     bus.set_exit_on_disconnect(False)
-    return glib, bus, service_factory, settings_factory, dbus.UInt32
+
+    def temperature_unit_factory(bus, callback):
+        return _TemperatureUnit(bus, vedbus.VeDbusItemImport, callback)
+
+    return (
+        glib,
+        bus,
+        service_factory,
+        settings_factory,
+        dbus.UInt32,
+        command_item,
+        temperature_unit_factory,
+    )
 
 
 class _Device:
     """D-Bus objects confined to the publisher thread."""
 
-    def __init__(self, owner, bus, service_factory, settings_factory, uint32_factory=int):
+    def __init__(
+        self,
+        owner,
+        bus,
+        service_factory,
+        settings_factory,
+        uint32_factory=int,
+        command_item=None,
+        temperature_unit_factory=None,
+    ):
         self.owner = owner
         self.bus = bus
         self.service_factory = service_factory
         self.uint32 = uint32_factory
+        self.command_item = command_item
+        self.received_at = None
+        self.temperature_unit = None
+        self.unit_setting = None
         self.service = None
         self.settings = settings_factory(
             bus,
@@ -174,6 +347,9 @@ class _Device:
         if owner._stop.is_set():
             raise IntegrationError("Venus OS device publisher is closed.")
         self.values = dict(_EMPTY)
+        if temperature_unit_factory is not None and owner.command_broker is not None:
+            self.unit_setting = temperature_unit_factory(bus, self._unit_changed)
+            self.temperature_unit = self.unit_setting.value
         self._register()
 
     def _register(self):
@@ -191,13 +367,36 @@ class _Device:
                 # Room is a supported temperature class in both current GUIs.
                 "/TemperatureType": 3,
             }
+            for prefix, kind, label in (
+                (_TEMPERATURE, 3, "Temperature setpoint"),
+                (_MODE, 6, "Heating mode"),
+            ):
+                metadata.update(
+                    {
+                        f"{prefix}/Name": label,
+                        f"{prefix}/State": None,
+                        f"{prefix}/Settings/Type": kind,
+                        f"{prefix}/Settings/ValidTypes": 1 << kind,
+                        f"{prefix}/Settings/Adjustable": 0,
+                        # GUI 1.2.40 predates Adjustable. Invalid optional fields
+                        # hide its setting editors and use device/name defaults.
+                        f"{prefix}/Settings/Group": None,
+                        f"{prefix}/Settings/CustomName": None,
+                        f"{prefix}/Settings/ShowUIControl": None,
+                    }
+                )
+            metadata.update(
+                {
+                    f"{_TEMPERATURE}/Settings/Decimals": 1,
+                    f"{_MODE}/Settings/Labels": ["Off", "Heat"],
+                    f"{_MODE}/Settings/DimmingMin": 0,
+                    f"{_MODE}/Settings/DimmingMax": 1,
+                    f"{_MODE}/Settings/StepSize": 1,
+                    f"{_MODE}/Settings/Decimals": 0,
+                }
+            )
             for path, value in (metadata | self.values).items():
-                options = {}
-                if path in ("/Temperature", "/Climate/TargetTemperature"):
-                    options["gettextcallback"] = _temperature_text
-                elif path == "/Climate/EstimatedHeatingPower":
-                    options["gettextcallback"] = lambda _p, v: "" if v is None else f"{v:g} W"
-                service.add_path(path, value, **options)
+                service.add_path(path, value, **self._path_options(path))
             # 0xffff is the sibling drivers' generic sentinel, not an assigned
             # Victron hardware model. Never claim an actual Victron product ID.
             service.add_path(
@@ -225,6 +424,25 @@ class _Device:
             self.close()
             raise
 
+    def _path_options(self, path):
+        options = {}
+        if path in ("/Temperature", "/Climate/TargetTemperature"):
+            options["gettextcallback"] = _temperature_text
+        elif path == "/Climate/EstimatedHeatingPower":
+            options["gettextcallback"] = lambda _p, v: "" if v is None else f"{v:g} W"
+        if (
+            path in (f"{_TEMPERATURE}/Dimming", f"{_MODE}/Dimming")
+            and self.owner.command_broker is not None
+        ):
+            if self.command_item is None:
+                raise IntegrationError("Venus OS command item is unavailable.")
+            options.update(
+                writeable=True,
+                onchangecallback=self._command,
+                itemtype=self.command_item,
+            )
+        return options
+
     def _rename(self, _path, value):
         if not _name(value):
             return False
@@ -233,6 +451,61 @@ class _Device:
         except Exception:
             return False
         return True
+
+    def _command(self, path, value):
+        broker = self.owner.command_broker
+        if (
+            broker is None
+            or self.service is None
+            or self.owner._stop.is_set()
+            or self.owner._failed
+            or self.received_at is None
+            or not 0 <= self.owner._clock() - self.received_at < self.owner._stale_seconds
+            or not self.values[_CONTROL_AVAILABLE]
+        ):
+            return False
+        try:
+            if self._submit_request(broker, path, value) is not True:
+                return False
+            # Queued requests remain coalescible. Only a subsequent broker
+            # snapshot can disable controls or confirm the observed result.
+            queued = self.values | {
+                _CONTROL_PENDING: 1,
+                _CONTROL_OUTCOME: "queued",
+                _CONTROL_REASON: "queued",
+            }
+        except Exception:
+            return False
+        try:
+            self._write_values(queued, self.received_at)
+        except Exception:
+            # The broker already accepted the request. A failed GUI update must
+            # not report rejection of a command that can still execute.
+            self.owner._failed = True
+        return True
+
+    def _submit_request(self, broker, path, value):
+        if path == f"{_TEMPERATURE}/Dimming":
+            if self.values[f"{_TEMPERATURE}/Status"] & _DISABLED:
+                return False
+            target = _number(
+                value,
+                self.values[f"{_TEMPERATURE}/Settings/DimmingMin"],
+                self.values[f"{_TEMPERATURE}/Settings/DimmingMax"],
+            )
+            if target is None:
+                return False
+            # The broker validates HA's native unit/step lattice; never round
+            # a GUI request into a different temperature here.
+            return broker.submit_temperature(target)
+        if path == f"{_MODE}/Dimming":
+            if self.values[f"{_MODE}/Status"] & _DISABLED:
+                return False
+            mode = _number(value, 0, 1)
+            if mode not in (0, 1):
+                return False
+            return broker.submit_mode("heat" if mode == 1 else "off")
+        return False
 
     def _setting_changed(self, setting, _old, value):
         if self.service is None:
@@ -248,8 +521,55 @@ class _Device:
         except Exception:
             self.owner._failed = True
 
-    def update(self, values):
+    def update(self, values, received_at=None):
+        values = dict(values)
+        self._apply_temperature_unit(values)
+        self._write_values(values, received_at)
+
+    def _apply_temperature_unit(self, values):
+        if self.temperature_unit == "fahrenheit":
+            # GUI 1.2.40 and current gui-v2 main convert temperatures and bounds,
+            # but deliberately interpret StepSize in the GUI's display unit.
+            values[f"{_TEMPERATURE}/Settings/StepSize"] *= 1.8
+        # Venus stores an empty string for the stock GUI's Celsius default.
+        elif self.temperature_unit not in ("", "celsius"):
+            values[f"{_TEMPERATURE}/Status"] = _DISABLED
+
+    def _unit_changed(self, value):
+        self.temperature_unit = value
+        try:
+            self.refresh_controls()
+        except Exception:
+            self.owner._failed = True
+
+    def refresh_controls(self):
+        broker = self.owner.command_broker
+        if broker is None or self.service is None:
+            return
+        control = broker.status()
+        if not isinstance(control, Mapping):
+            return
+        values = dict(self.values)
+        values.update({path: _EMPTY[path] for path in _CONTROL_KEYS})
+        _control_snapshot(control, values, True)
+        self._apply_temperature_unit(values)
+        if (
+            self.received_at is None
+            or not 0 <= self.owner._clock() - self.received_at < self.owner._stale_seconds
+        ):
+            values[_CONTROL_AVAILABLE] = 0
+            values[_CONTROL_REASON] = "telemetry_stale"
+            values[f"{_TEMPERATURE}/Status"] = _DISABLED
+            values[f"{_MODE}/Status"] = _DISABLED
+        # Control flags may change while HA I/O blocks the main thread. This
+        # refresh must never extend observation freshness or change readback.
+        self._write_values(
+            self.values | {path: values[path] for path in _CONTROL_KEYS}, self.received_at
+        )
+
+    def _write_values(self, values, received_at=None):
         self.values = dict(values)
+        self.received_at = received_at
         if self.service is None:
             if values["/Connected"]:
                 self._register()
@@ -260,10 +580,29 @@ class _Device:
             for path, value in values.items():
                 batch[path] = value
 
-    def close(self):
+    def invalidate(self):
+        # Loss of telemetry cannot prove that an outstanding request finished.
+        # Preserve its last reported state while disabling every command path.
+        self.update(
+            _EMPTY
+            | {
+                path: self.values[path]
+                for path in (
+                    _CONTROL_ENABLED,
+                    _CONTROL_PENDING,
+                    _CONTROL_OUTCOME,
+                )
+            }
+            | {_CONTROL_REASON: "telemetry_stale"}
+        )
+
+    def close(self, *, final=False):
         if self.service is not None:
             service, self.service = self.service, None
             service.__del__()
+        if final and self.unit_setting is not None:
+            self.unit_setting.close()
+            self.unit_setting = None
 
 
 class DbusDevicePublisher:
@@ -282,6 +621,7 @@ class DbusDevicePublisher:
         stale_seconds: float = 120,
         firmware_version: str = __version__,
         *,
+        command_broker=None,
         runtime_factory: Callable = _runtime,
         clock: Callable[[], float] = time.monotonic,
         startup_timeout: float = 10,
@@ -296,6 +636,12 @@ class DbusDevicePublisher:
             raise ValueError("device stale_seconds must be within 10..900")
         if _number(startup_timeout, 0.01, 30) is None:
             raise ValueError("device startup_timeout must be within 0.01..30")
+        if command_broker is not None and not all(
+            callable(getattr(command_broker, name, None))
+            for name in ("submit_temperature", "submit_mode", "status")
+        ):
+            raise ValueError("device command_broker must support thermostat requests")
+        self.command_broker = command_broker
         self.device_id = "inverter_climate_" + hashlib.sha256(identity.encode()).hexdigest()[:16]
         self.service_name = f"com.victronenergy.temperature.{self.device_id}"
         self.device_instance = device_instance
@@ -344,7 +690,7 @@ class DbusDevicePublisher:
         self.check_health()
         if not isinstance(status, Mapping):
             raise IntegrationError("Venus OS device telemetry is invalid.")
-        snapshot = _snapshot(status)
+        snapshot = _snapshot(status, commands_supported=self.command_broker is not None)
         with self._lock:
             # Only the latest snapshot is useful. A blocked GUI cannot cause an
             # unbounded backlog or replay old temperatures after recovery.
@@ -354,11 +700,15 @@ class DbusDevicePublisher:
         bus = device = glib = None
         timer = None
         try:
-            glib, bus, service_factory, settings_factory, uint32 = self._runtime_factory()
+            glib, bus, service_factory, settings_factory, uint32, command_item, unit_factory = (
+                self._runtime_factory()
+            )
             if self._stop.is_set():
                 return
             loop = glib.MainLoop()
-            device = _Device(self, bus, service_factory, settings_factory, uint32)
+            device = _Device(
+                self, bus, service_factory, settings_factory, uint32, command_item, unit_factory
+            )
             last_update = None
             last_connected = self._clock()
             stale = True
@@ -380,16 +730,17 @@ class DbusDevicePublisher:
                     if pending is not None:
                         last_update, values = pending
                         if self._clock() - last_update < self._stale_seconds:
-                            device.update(values)
+                            device.update(values, last_update)
                             if values["/Connected"]:
                                 last_connected = last_update
                             stale = False
+                    device.refresh_controls()
                     if (
                         last_update is not None
                         and self._clock() - last_update >= self._stale_seconds
                         and not stale
                     ):
-                        device.update(dict(_EMPTY))
+                        device.invalidate()
                         stale = True
                     if self._clock() - last_connected >= self._stale_seconds:
                         # A vanished direct counterpart should disappear from
@@ -414,7 +765,7 @@ class DbusDevicePublisher:
                 if timer is not None:
                     glib.source_remove(timer)
                 if device is not None:
-                    device.close()
+                    device.close(final=True)
             except Exception:
                 self._failed = True
             finally:
