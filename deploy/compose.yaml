@@ -1,0 +1,18 @@
+services:
+  inverter-climate:
+    build: ..
+    restart: unless-stopped
+    env_file: ../.env
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ../config.toml:/app/config.toml:ro
+      - climate-data:/data
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    stop_grace_period: 30s
+volumes:
+  climate-data:

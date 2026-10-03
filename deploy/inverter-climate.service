@@ -1,0 +1,24 @@
+[Unit]
+Description=Victron and Home Assistant climate coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=inverter-climate
+Group=inverter-climate
+WorkingDirectory=/opt/inverter-climate
+EnvironmentFile=/etc/inverter-climate/environment
+ExecStart=/opt/inverter-climate/.venv/bin/inverter-climate --config /etc/inverter-climate/config.toml
+Restart=on-failure
+RestartSec=30
+StateDirectory=inverter-climate
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/inverter-climate
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+.env
+.env.*
+!.env.example
+/config.toml
+state*.json
+status*.json
+*.lockfile
+private/
+logs/

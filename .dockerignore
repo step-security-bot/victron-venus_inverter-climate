@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.ruff_cache
+.env
+.env.*
+config.toml
+state*.json
+status*.json
+private
+logs
+dist
