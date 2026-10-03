@@ -15,7 +15,8 @@ from pathlib import Path
 
 START = "# === inverter-climate service persistence ==="
 END = "# === end inverter-climate ==="
-BOOT = START + "\npython3 -B /data/inverter-climate/deploy/venus/install.py boot\n" + END + "\n"
+RUNTIME = "/data/inverter-climate-runtime/current"
+BOOT = START + f"\npython3 -B {RUNTIME}/deploy/venus/install.py boot\n" + END + "\n"
 MARKER = "inverter-climate-native-v1\n"
 
 
@@ -142,9 +143,10 @@ class Installer:
     def __init__(self, root):
         self.root = root.resolve()
         self.offline = self.root != Path("/")
-        self.current = self.path("/data/inverter-climate")
-        self.previous = self.path("/data/inverter-climate.previous")
-        self.rollback_temporary = self.path("/data/.inverter-climate-rollback")
+        self.current = self.path(RUNTIME)
+        self.previous = self.current.parent / "previous"
+        self.rollback_temporary = self.current.parent / ".rollback"
+        self.legacy = self.path("/data/inverter-climate")
         self.options = self.path("/data/setupOptions/inverter-climate")
         self.definition = self.options / "service"
         self.link = self.path("/service/inverter-climate")
@@ -191,9 +193,14 @@ class Installer:
         self.definition.mkdir(parents=True, exist_ok=True)
         atomic_write(self.definition / ".owner", MARKER)
         for source, destination in (("run", "run"), ("log-run", "log/run")):
+            content = (self.current / "deploy/venus" / source).read_text()
+            # A migrated 0.2 bundle remains checksummed and unchanged. Render
+            # its launcher for the isolated runtime when rolling back to it.
+            content = content.replace("/data/inverter-climate/", RUNTIME + "/")
+            content = content.replace("cd /data/inverter-climate\n", f"cd {RUNTIME}\n")
             atomic_write(
                 self.definition / destination,
-                (self.current / "deploy/venus" / source).read_text(),
+                content,
                 0o755,
             )
         down = self.definition / "down"
@@ -219,6 +226,36 @@ class Installer:
             else:
                 raise RuntimeError("Service registered but supervisor is not ready")
 
+    def copy_legacy_bundle(self):
+        """Preserve the old payload before PackageManager replaces its source directory."""
+        if self.current.exists():
+            validate_bundle(self.current)
+            return
+        if self.previous.exists() or os.path.lexists(self.rollback_temporary):
+            raise ValueError("An interrupted update requires explicit rollback before migrating")
+        if not self.definition.is_dir():
+            raise ValueError("No owned legacy service is available for migration")
+        validate_bundle(self.legacy)
+        self.current.parent.mkdir(parents=True, exist_ok=True)
+        staged = Path(
+            tempfile.mkdtemp(prefix=".inverter-climate-migrate-", dir=self.current.parent)
+        )
+        try:
+            shutil.copytree(self.legacy, staged, dirs_exist_ok=True)
+            validate_bundle(staged)
+            move_bundle(staged, self.current)
+        finally:
+            if staged.exists():
+                shutil.rmtree(staged)
+
+    def migrate(self):
+        """Move an existing service onto isolated storage without changing its configuration."""
+        self.check_ownership()
+        enabled = self.definition.exists() and not (self.definition / "down").exists()
+        self.copy_legacy_bundle()
+        self.stop()
+        self.register(enabled)
+
     def install(self, bundle, start):
         validate_bundle(bundle)
         self.check_ownership()
@@ -243,8 +280,9 @@ class Installer:
             if sys.version_info < (3, 12):  # noqa: UP036 - executed directly on target firmware
                 raise ValueError("Venus OS must provide Python 3.12 or newer")
             code = (
-                "import sys, dbus, tomllib; sys.path[:0] = sys.argv[1:]; "
-                "import httpx, inverter_climate.service"
+                "import sys, dbus, tomllib; import dbus.mainloop.glib; "
+                "from gi.repository import GLib; sys.path[:0] = sys.argv[1:]; "
+                "import vedbus, settingsdevice, httpx, inverter_climate.service"
             )
             subprocess.run(
                 [
@@ -255,11 +293,23 @@ class Installer:
                     code,
                     str(bundle / "src"),
                     str(bundle / "vendor"),
+                    "/opt/victronenergy/dbus-systemcalc-py/ext/velib_python",
                 ],
                 check=True,
                 capture_output=True,
             )
         self.current.parent.mkdir(parents=True, exist_ok=True)
+        if not self.current.exists() and (self.legacy / "SHA256SUMS").is_file():
+            self.copy_legacy_bundle()
+        if (
+            self.current.exists()
+            and (self.current / "SHA256SUMS").read_bytes() == (bundle / "SHA256SUMS").read_bytes()
+        ):
+            # Reinstall after firmware replacement must restore registration,
+            # without replacing a useful previous release with the same bytes.
+            self.prepare_options()
+            self.register(enabled)
+            return
         staged = Path(tempfile.mkdtemp(prefix=".inverter-climate-stage-", dir=self.current.parent))
         stopped = False
         had_current = self.current.exists()
@@ -288,14 +338,22 @@ class Installer:
                 except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as recovery:
                     raise RuntimeError(
                         "Promotion failed and recovery is incomplete; run rollback from an "
-                        "extracted bundle or inverter-climate.previous/deploy/venus/install.py"
+                        "extracted package or "
+                        "inverter-climate-runtime/previous/deploy/venus/install.py"
                     ) from recovery
             raise error
         finally:
             # Retain the prepared bundle if even restoring the old copy failed.
             if staged.exists() and (not stopped or self.current.exists()):
                 shutil.rmtree(staged)
+        self.prepare_options()
+        self.register(enabled)
+
+    def prepare_options(self):
         self.options.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # SetupHelper creates this directory before invoking update.sh and may
+        # use its default umask. Private configuration requires owner-only access.
+        self.options.chmod(0o700)
         self.path("/data/inverter-climate-state").mkdir(parents=True, exist_ok=True, mode=0o700)
         atomic_write(
             self.options / "environment.example",
@@ -305,7 +363,6 @@ class Installer:
             self.options / "config.example.toml",
             (self.current / "examples/venus.toml").read_text(),
         )
-        self.register(enabled)
 
     def rollback(self):
         self.check_ownership()
@@ -384,7 +441,7 @@ def main():
     parser.add_argument(
         "action",
         nargs="?",
-        choices=("install", "start", "rollback", "uninstall", "boot"),
+        choices=("install", "start", "rollback", "uninstall", "boot", "migrate"),
         default="install",
     )
     parser.add_argument(

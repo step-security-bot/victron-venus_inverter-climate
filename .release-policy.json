@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "repository": "victron-venus/inverter-climate",
+  "mode": "release",
+  "visibility": "public",
+  "default_branch": "main",
+  "validation_workflows": ["ci.yml", "release-security.yml"],
+  "artifact_pattern": "release-assets*",
+  "version_file": "version",
+  "single_entry_ci": true,
+  "local_checks": ["bash scripts/ci.sh"],
+  "notes": [
+    "The SetupHelper package contains frozen pure Python HTTP dependencies and uses the firmware D-Bus module. Hosted checks do not prove the live firmware ABI or thermostat behavior.",
+    "Stable publication promotes the exact verified RC bytes. A separate verified publisher advances the SetupHelper latest branch from those stable bytes; it does not deploy to a device.",
+    "The root version begins with v for SetupHelper discovery. Python distribution and runtime versions use PEP 440 projections of the same frozen version plan."
+  ],
+  "pypi_assets": ["inverter_climate-*.whl"],
+  "versioning": {
+    "schema": 1,
+    "promotion": "promote-bytes",
+    "toolkit_revision": "29a852ec4d1466fcbd9598dd01352a8d8454312d",
+    "files": [
+      {"path": "version", "format": "text", "value": "package", "prefix": "v"},
+      {"path": "pyproject.toml", "format": "toml", "value": "package", "field": "project.version", "ecosystem": "pep440"},
+      {"path": "uv.lock", "format": "uv-lock", "value": "package", "package": "inverter-climate", "ecosystem": "pep440"},
+      {"path": "src/inverter_climate/__init__.py", "format": "python", "value": "package", "field": "__version__", "ecosystem": "pep440"}
+    ],
+    "artifacts": [
+      {"path": "inverter-climate-*.tar.gz", "format": "tar-text", "value": "package", "member": "inverter-climate/version", "prefix": "v"},
+      {"path": "inverter-climate-*.tar.gz", "format": "tar-toml", "value": "package", "member": "inverter-climate/pyproject.toml", "field": "project.version", "ecosystem": "pep440"},
+      {"path": "inverter_climate-*.whl", "format": "wheel", "package": "inverter-climate", "value": "package", "ecosystem": "pep440"}
+    ]
+  }
+}

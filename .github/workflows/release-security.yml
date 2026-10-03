@@ -1,0 +1,23 @@
+name: Release Security
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  security:
+    name: Release Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Block high and critical dependency, secret and configuration findings
+        uses: aquasecurity/trivy-action@d2a0b60797ff03db6132bd4e2b293f9b37081297 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          skip-dirs: .git,.venv,dist,release-dist,release-assets,build

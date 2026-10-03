@@ -83,6 +83,33 @@ class EnergyConfig:
 
 
 @dataclass(frozen=True)
+class DeviceConfig:
+    enabled: bool = True
+    device_instance: int = 80
+    custom_name: str = "Inverter Climate"
+    stale_seconds: float = 120
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("device enabled must be a boolean")
+        if type(self.device_instance) is not int or not 0 <= self.device_instance <= 255:
+            raise ValueError("device_instance must be an integer within 0..255")
+        if (
+            not isinstance(self.custom_name, str)
+            or not self.custom_name.strip()
+            or len(self.custom_name) > 64
+            or not self.custom_name.isprintable()
+        ):
+            raise ValueError("custom_name must be a nonempty name of at most 64 characters")
+        if (
+            isinstance(self.stale_seconds, bool)
+            or not isinstance(self.stale_seconds, (int, float))
+            or not 10 <= self.stale_seconds <= 900
+        ):
+            raise ValueError("device stale_seconds must be within 10..900 seconds")
+
+
+@dataclass(frozen=True)
 class Config:
     entity_id: str
     mode: str
@@ -91,16 +118,20 @@ class Config:
     status_path: Path
     policy: Policy
     energy: EnergyConfig = dataclass_field(default_factory=EnergyConfig)
+    device: DeviceConfig = dataclass_field(default_factory=DeviceConfig)
 
     @classmethod
     def load(cls, path: str) -> "Config":
         with open(path, "rb") as stream:
             data = tomllib.load(stream)
-        if set(data) - {"service", "policy", "energy"}:
+        if set(data) - {"service", "policy", "energy", "device"}:
             raise ValueError("unknown configuration section")
         service = data.get("service", {})
-        if any(not isinstance(data.get(key, {}), dict) for key in ("service", "policy", "energy")):
-            raise ValueError("service, policy and energy must be configuration tables")
+        if any(
+            not isinstance(data.get(key, {}), dict)
+            for key in ("service", "policy", "energy", "device")
+        ):
+            raise ValueError("service, policy, energy and device must be configuration tables")
         allowed = {"entity_id", "mode", "poll_seconds", "state_path", "status_path"}
         if set(service) - allowed:
             raise ValueError("unknown service setting")
@@ -133,4 +164,10 @@ class Config:
             energy = EnergyConfig(**energy_values)
         except TypeError as exc:
             raise ValueError("unknown energy setting") from exc
-        return cls(entity, mode, poll, state, status, policy, energy)
+        try:
+            device = DeviceConfig(**data.get("device", {}))
+        except TypeError as exc:
+            raise ValueError("unknown device setting") from exc
+        if energy.backend == "venus" and device.enabled and device.stale_seconds < 2 * poll:
+            raise ValueError("device stale_seconds must allow at least two poll intervals")
+        return cls(entity, mode, poll, state, status, policy, energy, device)
