@@ -289,3 +289,169 @@ def test_failed_firmware_preflight_keeps_existing_package_running(setup, tmp_pat
     assert "first" in (native.current / "src/inverter_climate/service.py").read_text()
     assert not native.previous.exists()
     assert not (native.definition / "down").exists()
+
+
+@pytest.mark.parametrize("prior_enabled", [False, True])
+@pytest.mark.parametrize("failed_rename", ["save_current", "promote_staged"])
+def test_failed_promotion_restores_current_and_prior_service_state(
+    setup, tmp_path, monkeypatch, prior_enabled, failed_rename
+):
+    native, first = setup
+    native.install(first, False)
+    configure(native)
+    if prior_enabled:
+        native.start()
+    original_rename = Path.rename
+    registered = []
+    original_register = native.register
+
+    def register(enabled):
+        registered.append(enabled)
+        original_register(enabled)
+
+    def fail(source, target):
+        if failed_rename == "save_current" and source == native.current:
+            raise OSError("simulated first rename failure")
+        if failed_rename == "promote_staged" and source.name.startswith(".inverter-climate-stage-"):
+            raise OSError("simulated promotion failure")
+        return original_rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", fail)
+    monkeypatch.setattr(native, "register", register)
+    with pytest.raises(OSError):
+        native.install(make_bundle(tmp_path / "candidate", "candidate"), True)
+    assert "first" in (native.current / "src/inverter_climate/service.py").read_text()
+    assert (native.definition / "down").exists() is not prior_enabled
+    assert registered == [prior_enabled]
+    assert not list(native.current.parent.glob(".inverter-climate-stage-*"))
+
+
+def test_failed_promotion_and_failed_recovery_retain_previous_for_explicit_rollback(
+    setup, tmp_path, monkeypatch
+):
+    native, first = setup
+    native.install(first, False)
+    configure(native)
+    native.start()
+    original_rename = Path.rename
+
+    def fail(source, target):
+        if source.name.startswith(".inverter-climate-stage-") or source == native.previous:
+            raise OSError("simulated promotion and restore failures")
+        return original_rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", fail)
+    with pytest.raises(RuntimeError, match="recovery is incomplete"):
+        native.install(make_bundle(tmp_path / "candidate", "candidate"), False)
+    assert not native.current.exists()
+    assert "first" in (native.previous / "src/inverter_climate/service.py").read_text()
+    assert len(list(native.current.parent.glob(".inverter-climate-stage-*"))) == 1
+    monkeypatch.setattr(Path, "rename", original_rename)
+    native.rollback()
+    assert "first" in (native.current / "src/inverter_climate/service.py").read_text()
+    assert not (native.definition / "down").exists()
+
+
+def test_install_refuses_to_delete_only_good_previous_after_interruption(setup, tmp_path):
+    native, first = setup
+    native.install(first, False)
+    native.current.rename(native.previous)
+    with pytest.raises(ValueError, match="explicit rollback"):
+        native.install(make_bundle(tmp_path / "candidate", "candidate"), False)
+    assert "first" in (native.previous / "src/inverter_climate/service.py").read_text()
+    native.rollback()
+    assert "first" in (native.current / "src/inverter_climate/service.py").read_text()
+    assert (native.definition / "down").exists()
+
+
+def test_promotion_fsync_failure_after_rename_restores_previous_version(
+    setup, tmp_path, monkeypatch
+):
+    native, first = setup
+    native.install(first, False)
+    configure(native)
+    native.start()
+    original_move = installer.move_bundle
+
+    def fail_after_rename(source, target):
+        original_move(source, target)
+        if source.name.startswith(".inverter-climate-stage-"):
+            raise OSError("simulated directory fsync failure after rename")
+
+    monkeypatch.setattr(installer, "move_bundle", fail_after_rename)
+    with pytest.raises(OSError):
+        native.install(make_bundle(tmp_path / "candidate", "candidate"), False)
+    assert "first" in (native.current / "src/inverter_climate/service.py").read_text()
+    assert "candidate" in (native.previous / "src/inverter_climate/service.py").read_text()
+    assert not (native.definition / "down").exists()
+    assert not native.rollback_temporary.exists()
+
+
+@pytest.mark.parametrize("step", [1, 2, 3])
+def test_rollback_rename_failure_keeps_current_or_explicitly_resumable_swap(
+    setup, tmp_path, monkeypatch, step
+):
+    native, first = setup
+    native.install(first, False)
+    configure(native)
+    native.start()
+    native.install(make_bundle(tmp_path / "second", "second"), False)
+    original_rename = Path.rename
+    count = 0
+
+    def fail(source, target):
+        nonlocal count
+        count += 1
+        if count == step:
+            raise OSError("simulated rollback rename failure")
+        return original_rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", fail)
+    with pytest.raises(OSError):
+        native.rollback()
+    assert native.current.is_dir()
+    assert not (native.definition / "down").exists()
+    if step in (1, 2):
+        assert "second" in (native.current / "src/inverter_climate/service.py").read_text()
+        assert "first" in (native.previous / "src/inverter_climate/service.py").read_text()
+        assert not native.rollback_temporary.exists()
+    else:
+        assert "first" in (native.current / "src/inverter_climate/service.py").read_text()
+        assert (
+            "second" in (native.rollback_temporary / "src/inverter_climate/service.py").read_text()
+        )
+        assert not native.previous.exists()
+    native.rollback()
+    assert "first" in (native.current / "src/inverter_climate/service.py").read_text()
+    assert "second" in (native.previous / "src/inverter_climate/service.py").read_text()
+    assert not native.rollback_temporary.exists()
+
+
+@pytest.mark.parametrize("completed_renames", [1, 2])
+def test_explicit_rollback_resumes_interrupted_swap_without_toggling_again(
+    setup, tmp_path, completed_renames
+):
+    native, first = setup
+    native.install(first, False)
+    native.install(make_bundle(tmp_path / "second", "second"), False)
+    native.current.rename(native.rollback_temporary)
+    if completed_renames == 2:
+        native.previous.rename(native.current)
+    native.rollback()
+    assert "first" in (native.current / "src/inverter_climate/service.py").read_text()
+    assert "second" in (native.previous / "src/inverter_climate/service.py").read_text()
+    assert not native.rollback_temporary.exists()
+    assert (native.definition / "down").exists()
+
+
+def test_ambiguous_rollback_preserves_every_copy_without_stopping(setup, tmp_path, monkeypatch):
+    native, first = setup
+    native.install(first, False)
+    native.install(make_bundle(tmp_path / "second", "second"), False)
+    shutil.copytree(first, native.rollback_temporary)
+    monkeypatch.setattr(native, "stop", lambda: pytest.fail("ambiguous recovery stopped service"))
+    with pytest.raises(ValueError, match="Ambiguous"):
+        native.rollback()
+    assert (
+        native.current.is_dir() and native.previous.is_dir() and native.rollback_temporary.is_dir()
+    )

@@ -143,6 +143,19 @@ python3 -B /data/inverter-climate/deploy/venus/install.py rollback
 svstat /service/inverter-climate
 ```
 
+If an interrupted update leaves the current bundle directory missing, invoke
+`rollback` from a verified extracted bundle, or from the retained previous copy:
+
+```sh
+python3 -B /data/inverter-climate.previous/deploy/venus/install.py rollback
+```
+
+The installer restores the previous bundle after a failed promotion when
+possible. Explicit rollback also resumes the recognized intermediate directory
+states of an interrupted swap. Ambiguous states preserve all copies for
+inspection. Do not delete recovery directories or retry installation over an
+incomplete update.
+
 To unregister the service after releasing any owned target:
 
 ```sh

@@ -34,6 +34,18 @@ def atomic_write(path, content, mode=0o600):
             os.unlink(name)
 
 
+def move_bundle(source, destination):
+    """Persist each rename boundary; never replace an existing recovery copy."""
+    if os.path.lexists(destination):
+        raise ValueError("Recovery destination already exists")
+    source.rename(destination)
+    directory = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def persistence(text, enabled):
     """Replace only our complete marked block; preserve the rest byte-for-byte."""
     lines = text.splitlines(keepends=True)
@@ -132,6 +144,7 @@ class Installer:
         self.offline = self.root != Path("/")
         self.current = self.path("/data/inverter-climate")
         self.previous = self.path("/data/inverter-climate.previous")
+        self.rollback_temporary = self.path("/data/.inverter-climate-rollback")
         self.options = self.path("/data/setupOptions/inverter-climate")
         self.definition = self.options / "service"
         self.link = self.path("/service/inverter-climate")
@@ -209,6 +222,10 @@ class Installer:
     def install(self, bundle, start):
         validate_bundle(bundle)
         self.check_ownership()
+        if os.path.lexists(self.rollback_temporary) or (
+            not self.current.exists() and self.previous.exists()
+        ):
+            raise ValueError("An interrupted update requires explicit rollback before installing")
         for existing in (self.current, self.previous):
             if existing.exists():
                 if existing.is_symlink():
@@ -216,7 +233,8 @@ class Installer:
                 validate_bundle(existing)
         if bundle.resolve() in (self.current, self.previous):
             raise ValueError("Install from a separate extracted bundle")
-        enabled = start or (self.definition.exists() and not (self.definition / "down").exists())
+        was_enabled = self.definition.exists() and not (self.definition / "down").exists()
+        enabled = start or was_enabled
         if enabled and not all(
             (self.options / name).is_file() for name in ("config.toml", "environment")
         ):
@@ -243,17 +261,39 @@ class Installer:
             )
         self.current.parent.mkdir(parents=True, exist_ok=True)
         staged = Path(tempfile.mkdtemp(prefix=".inverter-climate-stage-", dir=self.current.parent))
+        stopped = False
+        had_current = self.current.exists()
         try:
             shutil.copytree(bundle, staged, dirs_exist_ok=True)
             validate_bundle(staged)
             self.stop()
+            stopped = True
             if self.previous.exists():
                 shutil.rmtree(self.previous)
             if self.current.exists():
-                self.current.rename(self.previous)
-            staged.rename(self.current)
+                move_bundle(self.current, self.previous)
+            move_bundle(staged, self.current)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            if stopped:
+                try:
+                    if had_current and not staged.exists() and self.previous.exists():
+                        # The final rename may have succeeded before its fsync
+                        # failed. Restore the prior version through the same
+                        # recoverable swap used by an explicit rollback.
+                        self.rollback()
+                    elif not self.current.exists() and self.previous.exists():
+                        move_bundle(self.previous, self.current)
+                    if self.current.exists():
+                        self.register(was_enabled)
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as recovery:
+                    raise RuntimeError(
+                        "Promotion failed and recovery is incomplete; run rollback from an "
+                        "extracted bundle or inverter-climate.previous/deploy/venus/install.py"
+                    ) from recovery
+            raise error
         finally:
-            if staged.exists():
+            # Retain the prepared bundle if even restoring the old copy failed.
+            if staged.exists() and (not stopped or self.current.exists()):
                 shutil.rmtree(staged)
         self.options.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path("/data/inverter-climate-state").mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -269,16 +309,44 @@ class Installer:
 
     def rollback(self):
         self.check_ownership()
-        validate_bundle(self.current)
-        validate_bundle(self.previous)
+        current = os.path.lexists(self.current)
+        previous = os.path.lexists(self.previous)
+        temporary = os.path.lexists(self.rollback_temporary)
+        for path in (self.current, self.previous, self.rollback_temporary):
+            if os.path.lexists(path):
+                validate_bundle(path)
+        if temporary:
+            # Only these two shapes occur between the three swap renames.
+            if current == previous:
+                raise ValueError(
+                    "Ambiguous interrupted rollback; preserve all copies for inspection"
+                )
+        elif not previous:
+            raise ValueError("No previous bundle is available for rollback")
         enabled = self.definition.exists() and not (self.definition / "down").exists()
         self.stop()
-        temporary = self.path("/data/.inverter-climate-rollback")
-        if temporary.exists():
-            raise ValueError("A previous rollback is incomplete; inspect its temporary directory")
-        self.current.rename(temporary)
-        self.previous.rename(self.current)
-        temporary.rename(self.previous)
+        try:
+            if not temporary and current:
+                move_bundle(self.current, self.rollback_temporary)
+                temporary = True
+            if not self.current.exists():
+                move_bundle(self.previous, self.current)
+            if temporary:
+                move_bundle(self.rollback_temporary, self.previous)
+        except (OSError, ValueError) as error:
+            try:
+                # If the old target has not moved yet, abort back to the version
+                # running before this rollback. Otherwise keep the recovered
+                # current version and leave the temporary copy for completion.
+                if not self.current.exists() and self.rollback_temporary.exists():
+                    move_bundle(self.rollback_temporary, self.current)
+                if self.current.exists():
+                    self.register(enabled)
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as recovery:
+                raise RuntimeError(
+                    "Rollback recovery is incomplete; preserve all bundle copies"
+                ) from recovery
+            raise error
         self.register(enabled)
 
     def start(self):
