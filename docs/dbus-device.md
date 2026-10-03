@@ -4,8 +4,9 @@ Native continuous operation publishes a supported
 `com.victronenergy.temperature.inverter_climate_<identity-hash>` service. Its
 product name is **Inverter Climate** and its temperature type is **Room** (3).
 Both Venus GUIs support temperature devices. The stock device page shows room
-temperature and device information; it does not provide a thermostat control
-screen for the additional climate paths.
+temperature and device information. GUI v2 additionally renders optional native
+Switch pane controls through the standard Switchable Output API on this service.
+The additional `/Climate/*` telemetry does not itself create controls.
 
 The identity hash is derived from the configured thermostat binding. The service
 does not publish the HA URL, entity ID, token, or upstream response bodies.
@@ -24,9 +25,9 @@ Firmware `SettingsDevice` persists the name and
 `ClassAndVrmInstance = "temperature:<instance>"` under
 `/Settings/Devices/inverter_climate_<identity-hash>`. Existing settings win over
 configuration defaults. A valid instance change withdraws and re-announces the
-complete service so consumers discover the new instance. Only `/CustomName` is
-writable on the device, and changing it updates local settings. No device path
-can issue a thermostat command.
+complete service so consumers discover the new instance. `/CustomName` updates
+local settings. Thermostat commands are accepted only through the explicitly
+enabled Switchable Output paths described below; telemetry remains read-only.
 
 `ProductId` uses `0xffff`, matching the sibling projects' generic sentinel. This
 is not an assigned Victron product ID or a claim to be Victron hardware.
@@ -72,9 +73,49 @@ or energy counters, and therefore does not add a fictitious measured load to
 Victron totals. A gas furnace can have substantial electrical auxiliary demand;
 the configured estimate describes that demand, not its gas heating output.
 
-Publishing a device does not enable control. Only the existing coordinator's
-explicit active policy can send HA thermostat commands. One-shot, discovery and
-release commands do not create a temporary GUI device.
+Publishing a device does not enable control. The automatic policy requires
+`mode = "active"`, while direct user commands independently require
+`[device] control_enabled = true`. One-shot, discovery and release commands do
+not create a temporary GUI device.
+
+## Native manual controls
+
+GUI v2 1.2.40 supports both controls in its standard Switch pane. The
+[Victron Switchable Output API](https://github.com/victronenergy/venus/wiki/dbus#switch)
+allows these paths on an existing temperature service, so the original device
+instance and temperature history remain unchanged.
+
+- `/SwitchableOutput/0` is a temperature setpoint control (`Settings/Type = 3`).
+  `Dimming` holds the observed target in Celsius, and `Measurement` holds the
+  observed room temperature. Device limits and step determine slider bounds.
+- `/SwitchableOutput/1` is a dropdown (`Settings/Type = 6`) labelled Heating mode.
+  Its labels are `Off` and `Heat`, with corresponding `Dimming` values 0 and 1.
+
+Control settings are fixed (`Settings/Adjustable = 0`). The writable `Dimming`
+items validate and enqueue requests; they do not call HA from the D-Bus thread.
+They also do not replace observed values with requested values when a write is
+accepted. The publisher continues batched, change-only updates from observations.
+Stock GUI widgets can briefly preview a requested value while waiting; that is
+not a confirmed thermostat observation.
+
+GUI v2 1.2.40 converts temperature values and bounds to its display unit but uses
+`Settings/StepSize` directly. One read-only subscription to the shared
+`/Settings/System/Units/Temperature` setting adjusts that UI step for Celsius or
+Fahrenheit. Targets, measurements and bounds remain Celsius on D-Bus. An unknown
+display unit disables the slider while leaving supported mode control available.
+
+Manual control requires fresh HA capabilities, a supported value and no pending
+or uncertain command. The coordinator validates again before persisting intent
+and sending one HA request. Manual input takes priority over automatic preheat
+and starts the configured manual hold. Requests are not replayed after restart
+or blindly retried after a timeout. Successful submission alone is not proof
+that the thermostat has applied a command.
+
+When Nest is off, its target temperature may be absent. `/Temperature` and
+`/Connected` remain valid, the setpoint slider is hidden, and the mode dropdown
+can turn heating back on. Unsupported modes and stale or unavailable HA data
+disable control. The classic GUI remains a temperature display; remote control
+uses GUI v2, including VRM Remote Console.
 
 ## Freshness and recovery
 

@@ -1,6 +1,7 @@
 """Boundary tests for the observations that authorize thermostat writes."""
 
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
@@ -26,6 +27,7 @@ def climate_payload():
             "max_temp": 90,
             "target_temp_step": 1,
             "supported_features": 1,
+            "hvac_modes": ["heat", "off"],
         },
     }
 
@@ -91,9 +93,13 @@ def test_unknown_units_never_silently_become_celsius(unit):
 
 
 @pytest.mark.parametrize("unit, step", [("°F", 5 / 9), ("°C", 0.5)])
-def test_missing_device_precision_uses_conservative_native_step(unit, step):
+@pytest.mark.parametrize("explicit_null", [False, True])
+def test_missing_device_precision_uses_conservative_native_step(unit, step, explicit_null):
     data = climate_payload()
-    del data["attributes"]["target_temp_step"]
+    if explicit_null:
+        data["attributes"]["target_temp_step"] = None
+    else:
+        del data["attributes"]["target_temp_step"]
     climate = Climate.parse(data, "climate.furnace", unit)
     assert climate.step_c == pytest.approx(step)
 
@@ -139,6 +145,146 @@ def test_target_capability_is_not_inferred_from_other_feature_bits():
     data = climate_payload()
     data["attributes"]["supported_features"] = 2 | 16 | 128
     assert not Climate.parse(data, "climate.furnace", "°F").supports_target
+
+
+def test_capabilities_use_advertised_modes_and_support_bit_independently():
+    data = climate_payload()
+    climate = Climate.parse(data, "climate.furnace", "°F")
+    assert climate.hvac_modes == ("heat", "off")
+    assert climate.supports_heat_off
+    assert climate.can_set_temperature
+    assert climate.hvac_mode_command("off") == "off"
+    data["attributes"]["supported_features"] = 0
+    without_target = Climate.parse(data, "climate.furnace", "°F")
+    assert without_target.supports_heat_off
+    assert not without_target.can_set_temperature
+    assert without_target.hvac_mode_command("heat") == "heat"
+
+
+@pytest.mark.parametrize("modes", [None, []])
+def test_missing_advertised_modes_disable_manual_control_without_losing_observation(modes):
+    data = climate_payload()
+    data["attributes"]["hvac_modes"] = modes
+    climate = Climate.parse(data, "climate.furnace", "°F")
+    assert climate.current_c == pytest.approx(18.333333)
+    assert climate.hvac_modes == ()
+    assert not climate.supports_heat_off
+    assert not climate.can_set_temperature
+    with pytest.raises(InvalidObservation):
+        climate.hvac_mode_command("heat")
+    with pytest.raises(InvalidObservation):
+        climate.temperature_command(20)
+
+
+@pytest.mark.parametrize("modes", ["heat", ["heat", "heat"], [None], [True], ["Heat"], ["unknown"]])
+def test_invalid_mode_advertisements_cannot_authorize_manual_commands(modes):
+    data = climate_payload()
+    data["attributes"]["hvac_modes"] = modes
+    with pytest.raises(InvalidObservation, match="HVAC modes"):
+        Climate.parse(data, "climate.furnace", "°F")
+
+
+@pytest.mark.parametrize("mode", ["off", "auto", "heat_cool", "fan_only", "dry"])
+def test_missing_single_target_preserves_room_observation_and_explicit_heat_off(mode):
+    data = climate_payload()
+    data["state"] = mode
+    data["attributes"]["temperature"] = None
+    climate = Climate.parse(data, "climate.furnace", "°F")
+    assert climate.target_c is None
+    assert climate.current_c == pytest.approx(18.333333)
+    assert climate.supports_heat_off
+    assert climate.hvac_mode_command("heat") == "heat"
+    assert climate.hvac_mode_command("off") == "off"
+    assert not climate.can_set_temperature
+    with pytest.raises(InvalidObservation):
+        climate.temperature_command(20)
+
+
+@pytest.mark.parametrize("mode", ["cool", "auto", "heat_cool", "fan_only", "dry"])
+def test_other_valid_hvac_modes_remain_observable_but_reject_single_heating_target(mode):
+    data = climate_payload()
+    data["state"] = mode
+    climate = Climate.parse(data, "climate.furnace", "°F")
+    assert climate.mode == mode
+    assert climate.current_c == pytest.approx(18.333333)
+    with pytest.raises(InvalidObservation):
+        climate.temperature_command(20)
+
+
+@pytest.mark.parametrize("mode", [None, True, "Heat", "unknown", "arbitrary_mode"])
+def test_invalid_current_hvac_mode_is_not_coerced_into_an_observation(mode):
+    data = climate_payload()
+    data["state"] = mode
+    with pytest.raises(InvalidObservation):
+        Climate.parse(data, "climate.furnace", "°F")
+
+
+@pytest.mark.parametrize("value_c, native", [(10, 50), (20, 68), (30, 86), (19.4444, 67)])
+def test_fahrenheit_manual_command_uses_device_step_with_celsius_roundoff(value_c, native):
+    climate = Climate.parse(climate_payload(), "climate.furnace", "°F")
+    assert climate.temperature_command(value_c) == native
+
+
+def test_celsius_manual_target_uses_real_device_range_and_minimum_anchored_step():
+    data = climate_payload()
+    data["attributes"].update(
+        {
+            "current_temperature": 20,
+            "temperature": 20.25,
+            "min_temp": 10.25,
+            "max_temp": 30.25,
+            "target_temp_step": 0.5,
+        }
+    )
+    climate = Climate.parse(data, "climate.furnace", "°C")
+    for target in (10.25, 19.75, 30.25):
+        assert climate.temperature_command(target) == target
+    for target in (10, 20, 30.5):
+        with pytest.raises(InvalidObservation):
+            climate.temperature_command(target)
+
+
+@pytest.mark.parametrize("target", [9, 33, 19.5, 20.001, True, None, "20", float("nan"), 10**400])
+def test_out_of_range_off_step_and_malformed_manual_targets_are_rejected(target):
+    climate = Climate.parse(climate_payload(), "climate.furnace", "°F")
+    with pytest.raises(InvalidObservation):
+        climate.temperature_command(target)
+
+
+def test_dbus_boolean_cannot_become_a_numeric_manual_request():
+    dbus_boolean = type("Boolean", (int,), {"__module__": "dbus"})
+    value = dbus_boolean(1)
+    with pytest.raises(InvalidObservation):
+        number(value)
+
+
+def test_preset_and_incomplete_capability_block_manual_target_without_changing_mode():
+    climate = Climate.parse(climate_payload(), "climate.furnace", "°F")
+    for changed in (
+        replace(climate, preset="eco"),
+        replace(climate, target_c=None),
+        replace(climate, supports_target=False),
+        replace(climate, hvac_modes=("off",)),
+    ):
+        assert not changed.can_set_temperature
+        with pytest.raises(InvalidObservation):
+            changed.temperature_command(20)
+
+
+@pytest.mark.parametrize("mode", ["cool", "auto", "heat_cool", "", "Heat", True, None])
+def test_manual_mode_commands_are_explicit_heat_off_only(mode):
+    climate = Climate.parse(climate_payload(), "climate.furnace", "°F")
+    with pytest.raises(InvalidObservation):
+        climate.hvac_mode_command(mode)
+
+
+def test_mode_command_requires_requested_advertised_capability_not_current_state():
+    climate = Climate.parse(climate_payload(), "climate.furnace", "°F")
+    off_only = replace(climate, mode="heat", hvac_modes=("off",))
+    assert off_only.hvac_mode_command("off") == "off"
+    assert not off_only.supports_heat_off
+    with pytest.raises(InvalidObservation):
+        off_only.hvac_mode_command("heat")
 
 
 def test_energy_preserves_grid_export_and_battery_charge_signs():

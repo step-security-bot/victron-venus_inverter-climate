@@ -111,6 +111,9 @@ def test_daemon_publishes_but_foreground_probes_and_release_do_not(config, monke
         def wait(self, _):
             self.stopped = True
 
+        def wake(self):
+            pass
+
     class Publisher:
         def start(self):
             events.append("start")
@@ -132,13 +135,20 @@ def test_daemon_publishes_but_foreground_probes_and_release_do_not(config, monke
         "decision": {"action": "wait", "reason": "no_preheat_needed"},
         "errors": [],
     }
-    fake_service = SimpleNamespace(state=SimpleNamespace(phase="idle"), tick=lambda **_: result)
+    stop = Stop()
+    fake_service = SimpleNamespace(
+        state=SimpleNamespace(phase="idle"),
+        tick=lambda **_: result,
+        controls=stop,
+        manual_outstanding=False,
+        next_poll_seconds=lambda: config.poll_seconds,
+    )
     monkeypatch.setenv("HA_BASE_URL", "http://example.test")
     monkeypatch.setenv("HA_TOKEN", "example-token")
     monkeypatch.setattr(sys, "argv", ["inverter-climate", *command])
     monkeypatch.setattr(module.Config, "load", lambda _: config)
     monkeypatch.setattr(module, "Service", lambda *args, **kwargs: fake_service)
-    monkeypatch.setattr(module.threading, "Event", Stop)
+    monkeypatch.setattr(module.threading, "Event", lambda: stop)
     monkeypatch.setattr(module.signal, "signal", lambda *_: None)
     monkeypatch.setattr(
         module, "HomeAssistantClient", lambda *_: SimpleNamespace(close=lambda: None)

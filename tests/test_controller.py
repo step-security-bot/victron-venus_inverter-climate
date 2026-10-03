@@ -68,6 +68,24 @@ def test_observation_mode_never_creates_write_intent(climate, energy, policy):
     assert evaluate(state, climate, energy, policy, tick + 30).action == "would_boost"
 
 
+def test_native_off_to_heat_change_without_prior_target_starts_manual_hold(climate, energy, policy):
+    state = State()
+    off = replace(climate, mode="off", target_c=None)
+    assert evaluate(state, off, energy, policy, 10000, active=True).reason == "heat_mode_required"
+    assert evaluate(state, off, energy, policy, 10030, active=True).reason == "heat_mode_required"
+    result = evaluate(state, climate, energy, policy, 10060, active=True)
+    assert result.reason == "external_change_respected"
+    assert state.hold_until == 10060 + policy.manual_hold_seconds
+    assert state.surplus_since is None
+
+
+def test_missing_heat_target_cannot_create_automatic_intent(climate, energy, policy):
+    state = State()
+    result = evaluate(state, replace(climate, target_c=None), energy, policy, 10000, active=True)
+    assert result.reason == "thermostat_target_unavailable"
+    assert state.phase == "idle"
+
+
 def test_active_boost_records_recovery_intent_before_dispatch(climate, energy, policy):
     state = State()
     decision, tick = stabilize(state, climate, energy, policy)

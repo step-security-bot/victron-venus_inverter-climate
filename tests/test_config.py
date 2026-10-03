@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from inverter_climate.config import Config, Policy
+from inverter_climate.config import Config, DeviceConfig, Policy
 
 
 def write_config(tmp_path, contents):
@@ -16,8 +16,51 @@ def write_config(tmp_path, contents):
 def test_config_defaults_to_observation_only(tmp_path):
     config = Config.load(write_config(tmp_path, '[service]\nentity_id = "climate.furnace"\n'))
     assert config.mode == "observe"
+    assert config.device.control_enabled is False
     assert config.policy.heating_power_w == 500
     assert config.state_path != config.status_path
+
+
+@pytest.mark.parametrize("value", [1, 0, "true", None])
+def test_manual_control_requires_an_explicit_boolean(value):
+    with pytest.raises(ValueError, match="control_enabled"):
+        DeviceConfig(control_enabled=value)
+
+
+def test_manual_control_requires_native_device_publishing(tmp_path):
+    with pytest.raises(ValueError, match="enabled device publisher"):
+        DeviceConfig(enabled=False, control_enabled=True)
+    path = write_config(
+        tmp_path,
+        """
+[service]
+entity_id = "climate.furnace"
+[device]
+control_enabled = true
+""",
+    )
+    with pytest.raises(ValueError, match="Venus backend"):
+        Config.load(path)
+
+
+def test_manual_control_does_not_enable_automatic_policy(tmp_path):
+    config = Config.load(
+        write_config(
+            tmp_path,
+            """
+[service]
+entity_id = "climate.furnace"
+[energy]
+backend = "venus"
+solar_paths = ["/Dc/Pv/Power"]
+grid_phases = ["L1"]
+[device]
+control_enabled = true
+""",
+        )
+    )
+    assert config.device.control_enabled is True
+    assert config.mode == "observe"
 
 
 def test_explicit_active_mode_and_policy_override(tmp_path):
@@ -60,6 +103,8 @@ def test_entity_must_be_one_exact_climate_id(tmp_path, entity):
         "poll_seconds = nan",
         "actve = true",
         'state_path = "same.json"\nstatus_path = "./same.json"',
+        'state_path = "state.json"\nstatus_path = "./state.json.manual"',
+        'state_path = "state.json"\nstatus_path = "./state.json.lockfile"',
     ],
 )
 def test_invalid_service_settings_are_rejected(tmp_path, settings):

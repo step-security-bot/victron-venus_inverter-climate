@@ -85,6 +85,7 @@ class EnergyConfig:
 @dataclass(frozen=True)
 class DeviceConfig:
     enabled: bool = True
+    control_enabled: bool = False
     device_instance: int = 80
     custom_name: str = "Inverter Climate"
     stale_seconds: float = 120
@@ -92,6 +93,10 @@ class DeviceConfig:
     def __post_init__(self):
         if type(self.enabled) is not bool:
             raise ValueError("device enabled must be a boolean")
+        if type(self.control_enabled) is not bool:
+            raise ValueError("device control_enabled must be a boolean")
+        if self.control_enabled and not self.enabled:
+            raise ValueError("device control requires an enabled device publisher")
         if type(self.device_instance) is not int or not 0 <= self.device_instance <= 255:
             raise ValueError("device_instance must be an integer within 0..255")
         if (
@@ -150,6 +155,9 @@ class Config:
         state, status = map(Path, paths)
         if state.resolve() == status.resolve():
             raise ValueError("state_path and status_path must differ")
+        reserved = (state.with_name(state.name + ".manual"), Path(str(state) + ".lockfile"))
+        if any(status.resolve() == path.resolve() for path in reserved):
+            raise ValueError("status_path must not overwrite the command journal or process lock")
         try:
             policy = Policy(**data.get("policy", {}))
         except TypeError as exc:
@@ -168,6 +176,8 @@ class Config:
             device = DeviceConfig(**data.get("device", {}))
         except TypeError as exc:
             raise ValueError("unknown device setting") from exc
+        if device.control_enabled and energy.backend != "venus":
+            raise ValueError("device control requires the Venus backend")
         if energy.backend == "venus" and device.enabled and device.stale_seconds < 2 * poll:
             raise ValueError("device stale_seconds must allow at least two poll intervals")
         return cls(entity, mode, poll, state, status, policy, energy, device)

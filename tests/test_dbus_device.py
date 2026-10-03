@@ -1,4 +1,4 @@
-"""A temperature device must remain truthful, responsive and read-only."""
+"""Temperature telemetry and optional asynchronous controls stay truthful."""
 
 import queue
 import threading
@@ -8,7 +8,21 @@ from types import SimpleNamespace
 import pytest
 
 from inverter_climate.clients import IntegrationError
-from inverter_climate.dbus_device import DbusDevicePublisher, _Device, _firmware_version, _snapshot
+from inverter_climate.dbus_device import (
+    DbusDevicePublisher,
+    _command_item_type,
+    _Device,
+    _firmware_version,
+    _snapshot,
+    _TemperatureUnit,
+)
+
+
+def fake_method(*_args, **_kwargs):
+    return lambda function: function
+
+
+FakeCommandItem = _command_item_type(object, fake_method, lambda value: value)
 
 
 class FakeUInt32(int):
@@ -46,6 +60,21 @@ class FakeService:
         assert not self.registered
         self.paths[path] = value
         self.options[path] = options
+
+    def set_value(self, path, value):
+        options = self.options[path]
+        if not options.get("writeable"):
+            return 1
+        item = options["itemtype"]()
+        item._writeable = True
+        item._path = path
+        item._value = self.paths[path]
+        item._onchangecallback = options["onchangecallback"]
+        result = item.SetValue(value)
+        # An ordinary velib SetValue would mutate the value here, so also check
+        # the custom item itself has kept the last observed value untouched.
+        assert item._value == self.paths[path]
+        return result
 
     def register(self):
         assert "/Temperature" in self.paths
@@ -151,6 +180,16 @@ class Runtime:
         self.services = []
         self.settings = []
         self.now = 100
+        self.unit_setting = None
+
+    def unit_factory(self, _bus, callback):
+        self.unit_setting = SimpleNamespace(value="celsius", callback=callback, closed=False)
+
+        def close():
+            self.unit_setting.closed = True
+
+        self.unit_setting.close = close
+        return self.unit_setting
 
     def service_factory(self, *args, **kwargs):
         service = FakeService(*args, **kwargs)
@@ -163,7 +202,15 @@ class Runtime:
         return settings
 
     def __call__(self):
-        return self.glib, self.bus, self.service_factory, self.settings_factory, FakeUInt32
+        return (
+            self.glib,
+            self.bus,
+            self.service_factory,
+            self.settings_factory,
+            FakeUInt32,
+            FakeCommandItem,
+            self.unit_factory,
+        )
 
     def publisher(self, **kwargs):
         return DbusDevicePublisher(
@@ -470,8 +517,14 @@ def test_failed_energy_keeps_actual_room_measurement_but_marks_unhealthy():
 def test_invalid_temperatures_fail_closed(field, value):
     sample = status()
     sample["climate"][field] = value
-    assert _snapshot(sample)["/Connected"] == 0
-    assert _snapshot(sample)["/Temperature"] is None
+    values = _snapshot(sample)
+    if field == "current_c":
+        assert values["/Connected"] == 0
+        assert values["/Temperature"] is None
+    else:
+        assert values["/Connected"] == 1
+        assert values["/Temperature"] == 21.5
+        assert values["/Climate/TargetTemperature"] is None
 
 
 def test_snapshot_filters_unexpected_text_and_arbitrary_error_payloads():
@@ -555,8 +608,13 @@ def test_native_runtime_uses_explicit_mainloop_without_changing_energy_bus_defau
     imports = {
         "dbus": SimpleNamespace(SystemBus=system_bus, UInt32=FakeUInt32),
         "dbus.mainloop.glib": SimpleNamespace(DBusGMainLoop=lambda: loop),
+        "dbus.service": SimpleNamespace(method=fake_method),
         "gi.repository.GLib": object(),
-        "vedbus": SimpleNamespace(VeDbusService=FakeService),
+        "vedbus": SimpleNamespace(
+            VeDbusService=FakeService,
+            VeDbusItemExport=object,
+            unwrap_dbus_value=lambda value: value,
+        ),
         "settingsdevice": SimpleNamespace(SettingsDevice=FakeSettings),
     }
     monkeypatch.setattr(module.importlib, "import_module", imports.__getitem__)
@@ -613,8 +671,442 @@ def test_close_deregisters_device_closes_private_bus_and_cannot_restart():
         {"stale_seconds": 901},
         {"firmware_version": ""},
         {"startup_timeout": 0},
+        {"command_broker": object()},
     ],
 )
 def test_invalid_configuration_is_rejected_before_native_imports(kwargs):
     with pytest.raises(ValueError):
         DbusDevicePublisher(**({"identity": "identity"} | kwargs))
+
+
+class FakeBroker:
+    def __init__(self):
+        self.requests = []
+        self.accept = True
+        self.error = None
+        self.live_status = None
+
+    def status(self):
+        return self.live_status
+
+    def submit_temperature(self, value):
+        return self._submit("temperature", value)
+
+    def submit_mode(self, value):
+        return self._submit("mode", value)
+
+    def _submit(self, kind, value):
+        if self.error:
+            raise self.error
+        self.requests.append((kind, value))
+        return self.accept
+
+
+def controllable_status(**control):
+    sample = status()
+    sample["control"] = {
+        "enabled": True,
+        "available": True,
+        "pending": False,
+        "outcome": "idle",
+        "reason": "ready",
+        "can_set_temperature": True,
+        "can_set_mode": True,
+        "min_c": 10,
+        "max_c": 32,
+        "step_c": 0.5,
+        "supported_modes": ["off", "heat"],
+    } | control
+    return sample
+
+
+@pytest.fixture
+def controls():
+    runtime, broker = Runtime(), FakeBroker()
+    publisher = runtime.publisher(command_broker=broker)
+    publisher.start()
+    yield runtime, publisher, broker
+    publisher.close()
+
+
+def command(runtime, kind, value):
+    results = []
+    path = f"/SwitchableOutput/{kind}/Dimming"
+    runtime.glib.invoke(lambda: results.append(runtime.services[-1].set_value(path, value)))
+    return results[0]
+
+
+def test_switch_contract_uses_stock_temperature_and_dropdown_types(controls):
+    runtime, publisher, _broker = controls
+    publisher.publish(controllable_status())
+    runtime.glib.invoke()
+    service = runtime.services[-1]
+    for index, kind in ((0, 3), (1, 6)):
+        prefix = f"/SwitchableOutput/{index}"
+        assert service.paths[f"{prefix}/Settings/Type"] == kind
+        assert service.paths[f"{prefix}/Settings/ValidTypes"] == 1 << kind
+        assert service.paths[f"{prefix}/Settings/Adjustable"] == 0
+        for setting in ("Group", "CustomName", "ShowUIControl"):
+            assert service.paths[f"{prefix}/Settings/{setting}"] is None
+            assert not service.options[f"{prefix}/Settings/{setting}"].get("writeable")
+        assert service.paths[f"{prefix}/State"] is None
+        assert service.paths[f"{prefix}/Status"] == 0x09
+    assert service.paths["/SwitchableOutput/1/Settings/Labels"] == ["Off", "Heat"]
+    assert service.paths["/SwitchableOutput/0/Measurement"] == 21.5
+    assert service.paths["/SwitchableOutput/0/Dimming"] == 17
+    assert service.paths["/SwitchableOutput/1/Dimming"] == 1
+    assert {path for path, options in service.options.items() if options.get("writeable")} == {
+        "/CustomName",
+        "/SwitchableOutput/0/Dimming",
+        "/SwitchableOutput/1/Dimming",
+    }
+
+
+def test_commands_are_disabled_at_startup_and_without_broker(controls, running):
+    runtime, _publisher, broker = controls
+    assert command(runtime, 0, 20) == 2
+    assert command(runtime, 1, 1) == 2
+    assert not broker.requests
+    runtime, publisher = running
+    publisher.publish(controllable_status())
+    runtime.glib.invoke()
+    assert command(runtime, 0, 20) == 1
+    assert runtime.services[-1].paths["/Climate/ControlEnabled"] == 0
+    assert runtime.services[-1].paths["/SwitchableOutput/1/Status"] == 0x20
+
+
+def test_commands_enqueue_even_equal_values_and_never_echo_requested_state(controls):
+    runtime, publisher, broker = controls
+    publisher.publish(controllable_status())
+    runtime.glib.invoke()
+    assert command(runtime, 0, 17) == 0
+    assert command(runtime, 0, 20) == 0
+    assert command(runtime, 1, 0) == 0
+    service = runtime.services[-1]
+    assert broker.requests == [("temperature", 17), ("temperature", 20), ("mode", "off")]
+    assert service.paths["/SwitchableOutput/0/Dimming"] == 17
+    assert service.paths["/Climate/TargetTemperature"] == 17
+    assert service.paths["/SwitchableOutput/1/Dimming"] == 1
+    assert service.paths["/Climate/HvacMode"] == "heat"
+    assert service.paths["/Climate/ControlPending"] == 1
+    assert service.paths["/Climate/ControlOutcome"] == "queued"
+    assert service.paths["/SwitchableOutput/0/Status"] == 0x09
+    assert len(set(service.threads)) == 1
+    observed = controllable_status(outcome="confirmed")
+    observed["climate"]["target_c"] = 20
+    publisher.publish(observed)
+    runtime.glib.invoke()
+    assert service.paths["/SwitchableOutput/0/Dimming"] == 20
+    assert service.paths["/Climate/ControlPending"] == 0
+    assert service.paths["/Climate/ControlOutcome"] == "confirmed"
+
+
+def test_queued_requests_remain_coalescible_but_dispatched_requests_disable_controls(controls):
+    runtime, publisher, broker = controls
+    publisher.publish(controllable_status(pending=True, outcome="queued"))
+    runtime.glib.invoke()
+    assert command(runtime, 0, 20) == 0
+    publisher.publish(controllable_status(available=False, pending=True, outcome="pending"))
+    runtime.glib.invoke()
+    assert command(runtime, 0, 21) == 2
+    assert command(runtime, 1, 0) == 2
+    assert broker.requests == [("temperature", 20)]
+    assert runtime.services[-1].paths["/SwitchableOutput/0/Status"] == 0x20
+
+
+@pytest.mark.parametrize(
+    "kind,value",
+    [
+        (0, True),
+        (0, "20"),
+        (0, None),
+        (0, float("nan")),
+        (0, float("inf")),
+        (0, 9.99),
+        (0, 32.01),
+        (0, 10**400),
+        (1, True),
+        (1, "heat"),
+        (1, -1),
+        (1, 2),
+        (1, 0.5),
+        (1, float("nan")),
+    ],
+)
+def test_invalid_requests_never_reach_broker(controls, kind, value):
+    runtime, publisher, broker = controls
+    publisher.publish(controllable_status())
+    runtime.glib.invoke()
+    assert command(runtime, kind, value) == 2
+    assert not broker.requests
+    assert runtime.services[-1].paths["/Climate/ControlOutcome"] == "idle"
+
+
+@pytest.mark.parametrize(
+    "control",
+    [
+        {"enabled": False},
+        {"enabled": 1},
+        {"available": False},
+        {"available": 1},
+        {"can_set_temperature": False},
+        {"min_c": 35},
+        {"max_c": None},
+        {"step_c": 0},
+        {"step_c": float("nan")},
+    ],
+)
+def test_temperature_capabilities_fail_closed(controls, control):
+    runtime, publisher, broker = controls
+    publisher.publish(controllable_status(**control))
+    runtime.glib.invoke()
+    assert command(runtime, 0, 20) == 2
+    assert not broker.requests
+    assert runtime.services[-1].paths["/SwitchableOutput/0/Status"] == 0x20
+
+
+@pytest.mark.parametrize("supported", [None, [], ["heat"], ["off"], "heat,off"])
+def test_dropdown_does_not_offer_unsupported_mode_pair(controls, supported):
+    runtime, publisher, broker = controls
+    publisher.publish(controllable_status(supported_modes=supported))
+    runtime.glib.invoke()
+    assert command(runtime, 1, 0) == 2
+    assert not broker.requests
+    assert runtime.services[-1].paths["/SwitchableOutput/1/Status"] == 0x20
+
+
+def test_off_without_target_keeps_temperature_and_heat_mode_recovery(controls):
+    runtime, publisher, broker = controls
+    sample = controllable_status(can_set_temperature=False)
+    sample["climate"].update(mode="off", target_c=None, action="off")
+    publisher.publish(sample)
+    runtime.glib.invoke()
+    paths = runtime.services[-1].paths
+    assert paths["/Connected"] == 1
+    assert paths["/Temperature"] == 21.5
+    assert paths["/Climate/IntegrationHealthy"] == 1
+    assert paths["/Climate/TargetTemperature"] is None
+    assert paths["/SwitchableOutput/0/State"] is None
+    assert paths["/SwitchableOutput/0/Dimming"] is None
+    assert paths["/SwitchableOutput/0/Status"] == 0x20
+    assert paths["/SwitchableOutput/1/Dimming"] == 0
+    assert paths["/SwitchableOutput/1/Status"] == 0x09
+    assert command(runtime, 0, 20) == 2
+    assert command(runtime, 1, 1) == 0
+    assert broker.requests == [("mode", "heat")]
+    assert paths["/SwitchableOutput/1/Dimming"] == 0
+
+
+def test_expired_snapshot_rejects_write_before_timer_and_preserves_pending_unknown(controls):
+    runtime, publisher, broker = controls
+    publisher.publish(controllable_status(pending=True, outcome="queued"))
+    runtime.glib.invoke()
+    runtime.now += 120
+    assert command(runtime, 0, 20) == 2
+    assert not broker.requests
+    runtime.glib.invoke()
+    paths = runtime.services[-1].paths
+    assert paths["/Climate/ControlEnabled"] == 1
+    assert paths["/Climate/ControlAvailable"] == 0
+    assert paths["/Climate/ControlPending"] == 1
+    assert paths["/Climate/ControlReason"] == "telemetry_stale"
+    assert paths["/SwitchableOutput/0/Status"] == 0x20
+    assert paths["/SwitchableOutput/1/Dimming"] is None
+
+
+def test_energy_failure_does_not_disable_fresh_manual_ha_controls(controls):
+    runtime, publisher, _broker = controls
+    sample = controllable_status()
+    sample["errors"] = ["energy_read_failed"]
+    publisher.publish(sample)
+    runtime.glib.invoke()
+    assert runtime.services[-1].paths["/Climate/IntegrationHealthy"] == 0
+    assert command(runtime, 1, 0) == 0
+
+
+def test_broker_rejection_and_exception_do_not_claim_success(controls):
+    runtime, publisher, broker = controls
+    publisher.publish(controllable_status())
+    runtime.glib.invoke()
+    broker.accept = False
+    assert command(runtime, 0, 20) == 2
+    broker.error = RuntimeError("private upstream response")
+    assert command(runtime, 1, 0) == 2
+    paths = runtime.services[-1].paths
+    assert paths["/Climate/ControlOutcome"] == "idle"
+    assert paths["/SwitchableOutput/0/Dimming"] == 17
+    assert "private" not in repr(paths)
+    publisher.check_health()
+
+
+def test_publisher_preserves_fahrenheit_range_without_its_own_step_rounding(controls):
+    runtime, publisher, broker = controls
+    minimum, maximum, step = (50 - 32) * 5 / 9, (90 - 32) * 5 / 9, 5 / 9
+    publisher.publish(controllable_status(min_c=minimum, max_c=maximum, step_c=step))
+    runtime.glib.invoke()
+    assert command(runtime, 0, maximum) == 0
+    assert broker.requests == [("temperature", maximum)]
+    assert runtime.services[-1].paths["/SwitchableOutput/0/Settings/StepSize"] == step
+
+
+def test_command_item_obeys_completion_codes_without_optimistic_local_set():
+    item = FakeCommandItem()
+    item._path, item._value = "/command", 17
+    seen = []
+    item._onchangecallback = lambda path, value: seen.append((path, value)) or True
+    item._writeable = False
+    assert item.SetValue(17) == 1
+    assert not seen
+    item._writeable = True
+    assert item.SetValue(17) == 0
+    assert item.SetValue(20) == 0
+    assert seen == [("/command", 17), ("/command", 20)]
+    assert item._value == 17
+    item._onchangecallback = None
+    assert item.SetValue(20) == 1
+
+
+def test_control_diagnostics_filter_untrusted_text():
+    values = _snapshot(
+        controllable_status(reason="private URL/token\n", outcome="upstream secret"),
+        commands_supported=True,
+    )
+    assert values["/Climate/ControlReason"] == "unknown"
+    assert values["/Climate/ControlOutcome"] == "idle"
+    assert "secret" not in repr(values)
+
+
+def test_disabled_configuration_does_not_hide_an_outstanding_manual_intent():
+    values = _snapshot(
+        controllable_status(enabled=False, available=False, pending=True, outcome="unconfirmed"),
+        commands_supported=True,
+    )
+    assert values["/Climate/ControlEnabled"] == 0
+    assert values["/Climate/ControlPending"] == 1
+    assert values["/Climate/ControlOutcome"] == "unconfirmed"
+    assert values["/SwitchableOutput/1/Status"] == 0x20
+
+
+def test_accepted_request_stays_accepted_when_pending_telemetry_write_fails(controls):
+    runtime, publisher, broker = controls
+    publisher.publish(controllable_status())
+    runtime.glib.invoke()
+    runtime.services[-1].failure = RuntimeError("broken D-Bus signal")
+    assert command(runtime, 0, 20) == 0
+    assert broker.requests == [("temperature", 20)]
+    with pytest.raises(IntegrationError):
+        publisher.check_health()
+
+
+def test_live_broker_state_disables_blocked_or_expired_requests_without_refreshing_telemetry(
+    controls,
+):
+    runtime, publisher, broker = controls
+    publisher.publish(controllable_status())
+    runtime.glib.invoke()
+    original = dict(runtime.services[-1].paths)
+    broker.live_status = controllable_status(available=False, pending=True, outcome="pending")[
+        "control"
+    ]
+    runtime.now += 60
+    runtime.glib.invoke()
+    paths = runtime.services[-1].paths
+    assert paths["/Climate/ControlAvailable"] == 0
+    assert paths["/Climate/ControlPending"] == 1
+    assert paths["/SwitchableOutput/0/Status"] == 0x20
+    assert paths["/SwitchableOutput/1/Status"] == 0x20
+    for path in ("/Temperature", "/Climate/LastUpdate", "/SwitchableOutput/0/Dimming"):
+        assert paths[path] == original[path]
+    # Control polling must not turn 120-second-old telemetry into a fresh read.
+    runtime.now += 60
+    runtime.glib.invoke()
+    assert runtime.services[-1].closed
+    assert paths["/Temperature"] is None
+
+
+@pytest.mark.parametrize("initial_step", [0.5, 5 / 9])
+def test_gui_unit_changes_scale_only_display_step_and_never_compound(controls, initial_step):
+    runtime, publisher, broker = controls
+    sample = controllable_status(step_c=initial_step)
+    broker.live_status = sample["control"]
+    publisher.publish(sample)
+    runtime.glib.invoke()
+    paths = runtime.services[-1].paths
+    original = dict(paths)
+    assert paths["/SwitchableOutput/0/Settings/StepSize"] == initial_step
+    for unit, scale in (("fahrenheit", 1.8), ("fahrenheit", 1.8), ("celsius", 1)):
+        runtime.glib.invoke(lambda unit=unit: runtime.unit_setting.callback(unit))
+        assert paths["/SwitchableOutput/0/Settings/StepSize"] == pytest.approx(initial_step * scale)
+        runtime.glib.invoke()
+        assert paths["/SwitchableOutput/0/Settings/StepSize"] == pytest.approx(initial_step * scale)
+        assert paths["/SwitchableOutput/0/Status"] == 0x09
+        for path in (
+            "/Temperature",
+            "/Climate/LastUpdate",
+            "/SwitchableOutput/0/Dimming",
+            "/SwitchableOutput/0/Measurement",
+            "/SwitchableOutput/0/Settings/DimmingMin",
+            "/SwitchableOutput/0/Settings/DimmingMax",
+        ):
+            assert paths[path] == original[path]
+
+
+@pytest.mark.parametrize("unit", [None, "unknown", "F", 1])
+def test_missing_or_unknown_gui_unit_disables_only_temperature_control(controls, unit):
+    runtime, publisher, broker = controls
+    sample = controllable_status()
+    broker.live_status = sample["control"]
+    publisher.publish(sample)
+    runtime.glib.invoke()
+    runtime.glib.invoke(lambda: runtime.unit_setting.callback(unit))
+    paths = runtime.services[-1].paths
+    assert paths["/SwitchableOutput/0/Status"] == 0x20
+    assert paths["/SwitchableOutput/1/Status"] == 0x09
+    assert command(runtime, 0, 20) == 2
+    assert command(runtime, 1, 0) == 0
+
+
+def test_temperature_unit_subscription_is_read_only_and_recovers_settings_owner():
+    owner_callbacks, imports, observed, removed = [], [], [], []
+    next_value = ["celsius"]
+
+    def subscribe(callback, **kwargs):
+        assert kwargs == {
+            "signal_name": "NameOwnerChanged",
+            "dbus_interface": "org.freedesktop.DBus",
+            "bus_name": "org.freedesktop.DBus",
+            "arg0": "com.victronenergy.settings",
+        }
+        owner_callbacks.append(callback)
+        return SimpleNamespace(remove=lambda: removed.append(True))
+
+    class ReadOnlyItem:
+        def __init__(self, bus, service, path, *, eventCallback):
+            assert bus is fake_bus
+            assert service == "com.victronenergy.settings"
+            assert path == "/Settings/System/Units/Temperature"
+            self.callback = eventCallback
+            self.closed = False
+            imports.append(self)
+
+        def get_value(self):
+            return next_value[0]
+
+        def __del__(self):
+            self.closed = True
+
+    fake_bus = SimpleNamespace(add_signal_receiver=subscribe)
+    unit = _TemperatureUnit(fake_bus, ReadOnlyItem, observed.append)
+    assert unit.value == "celsius"
+    imports[-1].callback("service", "path", {"Value": "fahrenheit"})
+    assert unit.value == "fahrenheit"
+    owner_callbacks[0]("name", "old", "")
+    assert unit.value is None
+    next_value[0] = "celsius"
+    owner_callbacks[0]("name", "", "new")
+    assert imports[0].closed
+    assert unit.value == "celsius"
+    assert observed == ["fahrenheit", None, "celsius"]
+    unit.close()
+    assert imports[-1].closed
+    assert removed == [True]

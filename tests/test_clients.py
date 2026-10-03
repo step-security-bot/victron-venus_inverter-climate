@@ -64,6 +64,60 @@ def test_ha_set_temperature_calls_service_with_explicit_target():
     client.close()
 
 
+@pytest.mark.parametrize("mode", ["heat", "off"])
+def test_ha_set_hvac_mode_is_one_explicit_service_post_without_target_change(mode):
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert request.method == "POST"
+        assert request.url.path == "/api/services/climate/set_hvac_mode"
+        assert json.loads(request.content) == {
+            "entity_id": "climate.test_furnace",
+            "hvac_mode": mode,
+        }
+        assert request.headers["Authorization"] == "Bearer test-token"
+        return httpx.Response(200, json=[])
+
+    client = HomeAssistantClient(
+        "https://ha.example.invalid", "test-token", transport=httpx.MockTransport(handler)
+    )
+    assert client.set_hvac_mode("climate.test_furnace", mode) is None
+    assert len(seen) == 1
+    client.close()
+
+
+@pytest.mark.parametrize("mode", [None, True, 1, "Heat", "cool", "heat_cool", "", "off\n"])
+def test_invalid_or_out_of_scope_hvac_modes_never_send_requests(mode):
+    seen = []
+    client = HomeAssistantClient(
+        "https://ha.example.invalid",
+        "test-token",
+        transport=httpx.MockTransport(lambda request: seen.append(request)),
+    )
+    with pytest.raises(IntegrationError, match="heat or off"):
+        client.set_hvac_mode("climate.test_furnace", mode)
+    assert seen == []
+    client.close()
+
+
+def test_uncertain_mode_command_is_sanitized_and_never_retried():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        raise httpx.ReadTimeout("private HA response or credentials", request=request)
+
+    client = HomeAssistantClient(
+        "https://ha.example.invalid", "test-token", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(IntegrationError, match="failed or timed out") as caught:
+        client.set_hvac_mode("climate.test_furnace", "off")
+    assert "private" not in str(caught.value)
+    assert len(seen) == 1
+    client.close()
+
+
 def test_gateway_forwards_configured_auth_and_returns_raw_contract():
     payload = {
         "schema_version": 1,
@@ -165,6 +219,8 @@ def test_invalid_entity_ids_never_send_requests(entity):
         client.get_climate(entity)
     with pytest.raises(IntegrationError):
         client.set_temperature(entity, 20)
+    with pytest.raises(IntegrationError):
+        client.set_hvac_mode(entity, "off")
     assert seen == []
     client.close()
 
@@ -278,6 +334,8 @@ def test_discovery_and_service_reject_malformed_response_shapes(body):
         client.discover_climates()
     with pytest.raises(IntegrationError, match="invalid service response"):
         client.set_temperature("climate.test", 20)
+    with pytest.raises(IntegrationError, match="invalid service response"):
+        client.set_hvac_mode("climate.test", "heat")
     client.close()
 
 
