@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from inverter_climate.clients import IntegrationError
-from inverter_climate.dbus_device import DbusDevicePublisher, _Device, _firmware_number, _snapshot
+from inverter_climate.dbus_device import DbusDevicePublisher, _Device, _firmware_version, _snapshot
 
 
 class FakeUInt32(int):
@@ -282,7 +282,7 @@ def test_snapshot_is_batched_on_worker_and_estimated_power_is_never_measured_pow
     assert service.threads[0] != threading.get_ident()
 
 
-def test_numeric_metadata_and_human_gettext_follow_victron_contract(running):
+def test_metadata_raw_values_and_text_suit_both_victron_gui_generations(running):
     runtime, publisher = running
     publisher.publish(status())
     runtime.glib.invoke()
@@ -295,9 +295,12 @@ def test_numeric_metadata_and_human_gettext_follow_victron_contract(running):
 
     assert type(service.paths["/ProductId"]) is FakeUInt32
     assert text("/ProductId") == "0xffff"
-    assert type(service.paths["/FirmwareVersion"]) is FakeUInt32
-    assert service.paths["/FirmwareVersion"] == _firmware_number(publisher.firmware_version)
+    # GUI v2 formats integers as hex/BCD (3000 becomes vB.B8), but passes string
+    # versions through unchanged. GUI v1 uses the same human-readable GetText.
+    assert type(service.paths["/FirmwareVersion"]) is str
+    assert service.paths["/FirmwareVersion"] == publisher.firmware_version
     assert text("/FirmwareVersion") == publisher.firmware_version
+    assert service.paths["/HardwareVersion"] == "Virtual"
     assert text("/HardwareVersion") == "Virtual"
     assert text("/Temperature") == "21.5 °C"
     assert text("/Climate/TargetTemperature") == "17.0 °C"
@@ -305,14 +308,12 @@ def test_numeric_metadata_and_human_gettext_follow_victron_contract(running):
     assert service.options["/Temperature"]["gettextcallback"]("/Temperature", None) == ""
 
 
-def test_firmware_encoding_is_monotonic_across_release_components():
+def test_firmware_version_validates_and_retains_canonical_release_identity():
     versions = ["0.0.0", "0.2.0", "0.2.1", "0.3.0", "0.999.999", "1.0.0", "999.999.999"]
-    values = [_firmware_number(version) for version in versions]
-    assert values == sorted(set(values))
-    assert max(values) < 2**32
+    assert [_firmware_version(version) for version in versions] == versions
     for invalid in ("0.2", "01.2.0", "1.1000.0", None, "secret"):
         with pytest.raises(ValueError):
-            _firmware_number(invalid)
+            _firmware_version(invalid)
 
 
 @pytest.mark.parametrize(
@@ -326,13 +327,13 @@ def test_firmware_encoding_is_monotonic_across_release_components():
         "0.3.0.dev18446744073709551614",
     ],
 )
-def test_release_runtime_versions_preserve_full_text_and_share_numeric_base(version):
+def test_release_runtime_versions_preserve_full_raw_value_and_text(version):
     runtime = Runtime()
     publisher = runtime.publisher(firmware_version=version)
     publisher.start()
     try:
         service = runtime.services[0]
-        assert service.paths["/FirmwareVersion"] == 3000
+        assert service.paths["/FirmwareVersion"] == version
         assert (
             service.options["/FirmwareVersion"]["gettextcallback"](
                 "/FirmwareVersion", service.paths["/FirmwareVersion"]

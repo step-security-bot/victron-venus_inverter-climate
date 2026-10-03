@@ -103,7 +103,7 @@ def _snapshot(status: Mapping) -> dict:
     return values
 
 
-def _firmware_number(version: str) -> int:
+def _firmware_version(version: str) -> str:
     match = None
     if isinstance(version, str) and len(version) <= 64:
         match = re.fullmatch(
@@ -114,10 +114,7 @@ def _firmware_number(version: str) -> int:
         )
     if match is None or (match["sequence"] is not None and int(match["sequence"]) > 2**64 - 2):
         raise ValueError("device firmware_version must be a canonical PEP 440 release")
-    # Release plans retain their exact PEP 440 identity in GetText. Numeric
-    # metadata identifies the ordered base; prereleases of a base share it.
-    major, minor, patch = map(int, match["base"].split("."))
-    return major * 1000000 + minor * 1000 + patch
+    return version
 
 
 def _temperature_text(_path, value):
@@ -208,11 +205,14 @@ class _Device:
             )
             service.add_path(
                 "/FirmwareVersion",
-                self.uint32(owner.firmware_number),
+                # GUI v2 reads the raw value over MQTT and treats integers as
+                # Victron hex/BCD versions. It explicitly preserves strings;
+                # use that supported path for our full PEP 440 identity.
+                owner.firmware_version,
                 gettextcallback=lambda _p, _v: owner.firmware_version,
             )
             service.add_path(
-                "/HardwareVersion", self.uint32(0), gettextcallback=lambda _p, _v: "Virtual"
+                "/HardwareVersion", "Virtual", gettextcallback=lambda _p, _v: "Virtual"
             )
             service.add_path(
                 "/CustomName",
@@ -300,8 +300,7 @@ class DbusDevicePublisher:
         self.service_name = f"com.victronenergy.temperature.{self.device_id}"
         self.device_instance = device_instance
         self.custom_name = custom_name
-        self.firmware_version = firmware_version
-        self.firmware_number = _firmware_number(firmware_version)
+        self.firmware_version = _firmware_version(firmware_version)
         self._stale_seconds = stale_seconds
         self._runtime_factory = runtime_factory
         self._clock = clock
