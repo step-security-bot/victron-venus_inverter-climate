@@ -4,6 +4,7 @@ import math
 import re
 import tomllib
 from dataclasses import dataclass, fields
+from dataclasses import field as dataclass_field
 from pathlib import Path
 
 
@@ -56,6 +57,32 @@ class Policy:
 
 
 @dataclass(frozen=True)
+class EnergyConfig:
+    backend: str = "gateway"
+    solar_paths: tuple[str, ...] = ()
+    grid_phases: tuple[str, ...] = ()
+    timeout_seconds: float = 5
+
+    def __post_init__(self):
+        if self.backend not in ("gateway", "venus"):
+            raise ValueError("energy backend must be gateway or venus")
+        for value in (self.solar_paths, self.grid_phases):
+            if not isinstance(value, tuple) or any(not isinstance(item, str) for item in value):
+                raise ValueError("energy source selections must be arrays of strings")
+        if self.backend == "venus":
+            if not self.solar_paths or not self.grid_phases:
+                raise ValueError("Venus requires explicit solar_paths and grid_phases")
+        elif self.solar_paths or self.grid_phases:
+            raise ValueError("local source selections require the Venus backend")
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, (int, float))
+            or not 0 < self.timeout_seconds <= 10
+        ):
+            raise ValueError("energy timeout must be within (0, 10] seconds")
+
+
+@dataclass(frozen=True)
 class Config:
     entity_id: str
     mode: str
@@ -63,16 +90,17 @@ class Config:
     state_path: Path
     status_path: Path
     policy: Policy
+    energy: EnergyConfig = dataclass_field(default_factory=EnergyConfig)
 
     @classmethod
     def load(cls, path: str) -> "Config":
         with open(path, "rb") as stream:
             data = tomllib.load(stream)
-        if set(data) - {"service", "policy"}:
+        if set(data) - {"service", "policy", "energy"}:
             raise ValueError("unknown configuration section")
         service = data.get("service", {})
-        if not isinstance(service, dict) or not isinstance(data.get("policy", {}), dict):
-            raise ValueError("service and policy must be configuration tables")
+        if any(not isinstance(data.get(key, {}), dict) for key in ("service", "policy", "energy")):
+            raise ValueError("service, policy and energy must be configuration tables")
         allowed = {"entity_id", "mode", "poll_seconds", "state_path", "status_path"}
         if set(service) - allowed:
             raise ValueError("unknown service setting")
@@ -95,4 +123,14 @@ class Config:
             policy = Policy(**data.get("policy", {}))
         except TypeError as exc:
             raise ValueError("unknown policy setting") from exc
-        return cls(entity, mode, poll, state, status, policy)
+        energy_values = dict(data.get("energy", {}))
+        for key in ("solar_paths", "grid_phases"):
+            if key in energy_values:
+                if not isinstance(energy_values[key], list):
+                    raise ValueError(f"{key} must be an array")
+                energy_values[key] = tuple(energy_values[key])
+        try:
+            energy = EnergyConfig(**energy_values)
+        except TypeError as exc:
+            raise ValueError("unknown energy setting") from exc
+        return cls(entity, mode, poll, state, status, policy, energy)

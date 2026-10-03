@@ -1,5 +1,8 @@
 # Deployment
 
+For Venus OS, use the [native installation](venus/README.md). The alternatives
+below run externally and read energy through inverter-gateway.
+
 Start in `mode = "observe"`. Confirm HA temperature units, actual heating draw,
 gateway source/sign completeness and a useful comfort band before selecting
 active operation. Configure a gateway read token; the service never needs an
