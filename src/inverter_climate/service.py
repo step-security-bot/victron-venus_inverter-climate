@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict
+from typing import Protocol
 
 from . import __version__
 from .clients import GatewayClient, HomeAssistantClient, IntegrationError
@@ -25,12 +26,46 @@ def required_env(name: str) -> str:
     return value
 
 
+class EnergyClient(Protocol):
+    def get_energy(self) -> dict: ...
+
+    def close(self) -> None: ...
+
+
+def make_energy_client(config: Config) -> EnergyClient:
+    if config.energy.backend == "venus":
+        from .venus import VenusEnergyClient
+
+        return VenusEnergyClient(
+            solar_paths=config.energy.solar_paths,
+            grid_phases=config.energy.grid_phases,
+            timeout_seconds=config.energy.timeout_seconds,
+        )
+    return GatewayClient(
+        required_env("GATEWAY_BASE_URL"),
+        required_env("GATEWAY_READ_TOKEN"),
+        cf_client_id=os.environ.get("CF_ACCESS_CLIENT_ID", ""),
+        cf_client_secret=os.environ.get("CF_ACCESS_CLIENT_SECRET", ""),
+        timeout_seconds=config.energy.timeout_seconds,
+    )
+
+
+def journal_signature(state) -> dict:
+    # Poll timestamps and surplus qualification are transient. Restarting always
+    # requalifies surplus, so stable observation needs no recurring SD-card writes.
+    return {
+        key: value
+        for key, value in asdict(state).items()
+        if key not in ("last_tick", "surplus_since")
+    }
+
+
 class Service:
     def __init__(
         self,
         config: Config,
         ha: HomeAssistantClient,
-        gateway: GatewayClient,
+        gateway: EnergyClient,
         binding: str,
         *,
         clock=time.time,
@@ -41,6 +76,11 @@ class Service:
         self.binding = binding
         self.clock = clock
         self.state = load_state(config.state_path, binding)
+        self.state.surplus_since = None
+        self._saved_signature = (
+            journal_signature(self.state) if config.state_path.exists() else None
+        )
+        self._last_saved_at = clock()
 
     def read_climate(self) -> Climate:
         config = self.ha.get_config()
@@ -82,12 +122,12 @@ class Service:
             # still a possible race, documented rather than hidden.
             try:
                 if decision.action == "boost" and not release:
-                    energy = Energy.parse(
-                        self.gateway.get_energy(),
-                        self.clock(),
-                        self.config.policy.max_energy_age_seconds,
-                    )
+                    raw = self.gateway.get_energy()
                 climate = self.read_climate()
+                if decision.action == "boost" and not release:
+                    energy = Energy.parse(
+                        raw, self.clock(), self.config.policy.max_energy_age_seconds
+                    )
             except (IntegrationError, InvalidObservation):
                 self.state = before
                 self.state.surplus_since = None
@@ -98,8 +138,22 @@ class Service:
                 decision = evaluate(
                     self.state, climate, energy, self.config.policy, self.clock(), active=True
                 )
-        # A failure here stops the process before a command is sent.
-        save_state(self.config.state_path, self.binding, self.state)
+        # A failure here stops the process before a command is sent. Preserve
+        # ownership/manual changes immediately; checkpoint owned boosts every
+        # minute, while unchanged observation leaves persistent flash untouched.
+        signature = journal_signature(self.state)
+        now = self.clock()
+        checkpoint = self.state.phase != "idle" and (
+            now - self._last_saved_at >= 60 or now < self._last_saved_at
+        )
+        if (
+            signature != self._saved_signature
+            or checkpoint
+            or decision.action in ("boost", "restore")
+        ):
+            save_state(self.config.state_path, self.binding, self.state)
+            self._saved_signature = signature
+            self._last_saved_at = now
         if decision.action in ("boost", "restore"):
             try:
                 self.ha.set_temperature(
@@ -111,6 +165,7 @@ class Service:
             "schema_version": 1,
             "generated_at": self.clock(),
             "mode": self.config.mode,
+            "energy_backend": self.config.energy.backend,
             "phase": self.state.phase,
             "decision": asdict(decision),
             "climate": asdict(climate) if climate else None,
@@ -147,12 +202,7 @@ def main() -> int:
                 )
             return 0
         config = Config.load(args.config)
-        gateway = GatewayClient(
-            required_env("GATEWAY_BASE_URL"),
-            required_env("GATEWAY_READ_TOKEN"),
-            cf_client_id=os.environ.get("CF_ACCESS_CLIENT_ID", ""),
-            cf_client_secret=os.environ.get("CF_ACCESS_CLIENT_SECRET", ""),
-        )
+        gateway = make_energy_client(config)
         stop = threading.Event()
         for signum in (signal.SIGINT, signal.SIGTERM):
             signal.signal(signum, lambda *_: stop.set())

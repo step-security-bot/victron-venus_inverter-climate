@@ -103,8 +103,15 @@ class Energy:
     def parse(cls, data: dict, now: float, max_age: float) -> "Energy":
         if type(data.get("schema_version")) is not int or data["schema_version"] != 1:
             raise InvalidObservation("unsupported energy schema")
-        if data.get("mqtt_connected") is not True:
-            raise InvalidObservation("gateway MQTT disconnected")
+        source_type = data.get("source_type")
+        if source_type == "venus_dbus":
+            if data.get("source_connected") is not True:
+                raise InvalidObservation("local D-Bus source disconnected")
+        elif source_type is None:
+            if data.get("mqtt_connected") is not True:
+                raise InvalidObservation("gateway MQTT disconnected")
+        else:
+            raise InvalidObservation("unsupported energy source type")
         generated = number(data.get("generated_at"))
         response_age = now - generated
         if response_age < -5 or response_age > max_age:

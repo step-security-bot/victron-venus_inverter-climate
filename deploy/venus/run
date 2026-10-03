@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+exec 2>&1
+umask 077
+mkdir -p /run/inverter-climate
+cd /data/inverter-climate
+set -a
+. /data/setupOptions/inverter-climate/environment
+set +a
+export PYTHONPATH=/data/inverter-climate/src:/data/inverter-climate/vendor
+export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+exec python3 -m inverter_climate.service --config /data/setupOptions/inverter-climate/config.toml
