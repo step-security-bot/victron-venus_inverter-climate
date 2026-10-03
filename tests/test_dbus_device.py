@@ -173,7 +173,7 @@ class FakeGLib:
 
 
 class Runtime:
-    def __init__(self, persisted=None):
+    def __init__(self, persisted=None, temperature_unit="celsius"):
         self.glib = FakeGLib()
         self.bus = FakeBus()
         self.persisted = persisted
@@ -181,9 +181,12 @@ class Runtime:
         self.settings = []
         self.now = 100
         self.unit_setting = None
+        self.temperature_unit = temperature_unit
 
     def unit_factory(self, _bus, callback):
-        self.unit_setting = SimpleNamespace(value="celsius", callback=callback, closed=False)
+        self.unit_setting = SimpleNamespace(
+            value=self.temperature_unit, callback=callback, closed=False
+        )
 
         def close():
             self.unit_setting.closed = True
@@ -1034,7 +1037,7 @@ def test_gui_unit_changes_scale_only_display_step_and_never_compound(controls, i
     paths = runtime.services[-1].paths
     original = dict(paths)
     assert paths["/SwitchableOutput/0/Settings/StepSize"] == initial_step
-    for unit, scale in (("fahrenheit", 1.8), ("fahrenheit", 1.8), ("celsius", 1)):
+    for unit, scale in (("fahrenheit", 1.8), ("fahrenheit", 1.8), ("", 1), ("celsius", 1)):
         runtime.glib.invoke(lambda unit=unit: runtime.unit_setting.callback(unit))
         assert paths["/SwitchableOutput/0/Settings/StepSize"] == pytest.approx(initial_step * scale)
         runtime.glib.invoke()
@@ -1049,6 +1052,28 @@ def test_gui_unit_changes_scale_only_display_step_and_never_compound(controls, i
             "/SwitchableOutput/0/Settings/DimmingMax",
         ):
             assert paths[path] == original[path]
+
+
+def test_firmware_default_temperature_unit_enables_celsius_controls_at_startup():
+    runtime, broker = Runtime(temperature_unit=""), FakeBroker()
+    publisher = runtime.publisher(command_broker=broker)
+    try:
+        publisher.start()
+        sample = controllable_status()
+        broker.live_status = sample["control"]
+        publisher.publish(sample)
+        runtime.glib.invoke()
+        paths = runtime.services[-1].paths
+        assert paths["/SwitchableOutput/0/Status"] == 0x09
+        assert paths["/SwitchableOutput/0/Settings/StepSize"] == 0.5
+        assert command(runtime, 0, 20) == 0
+        runtime.glib.invoke(lambda: runtime.unit_setting.callback(None))
+        assert paths["/SwitchableOutput/0/Status"] == 0x20
+        runtime.glib.invoke(lambda: runtime.unit_setting.callback(""))
+        assert paths["/SwitchableOutput/0/Status"] == 0x09
+        assert paths["/SwitchableOutput/0/Settings/StepSize"] == 0.5
+    finally:
+        publisher.close()
 
 
 @pytest.mark.parametrize("unit", [None, "unknown", "F", 1])

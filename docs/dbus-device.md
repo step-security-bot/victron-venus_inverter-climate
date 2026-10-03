@@ -101,7 +101,8 @@ not a confirmed thermostat observation.
 GUI v2 1.2.40 converts temperature values and bounds to its display unit but uses
 `Settings/StepSize` directly. One read-only subscription to the shared
 `/Settings/System/Units/Temperature` setting adjusts that UI step for Celsius or
-Fahrenheit. Targets, measurements and bounds remain Celsius on D-Bus. An unknown
+Fahrenheit. The firmware's empty unit preference uses Celsius, matching the
+stock GUI default. Targets, measurements and bounds remain Celsius on D-Bus. An unknown
 display unit disables the slider while leaving supported mode control available.
 
 Manual control requires fresh HA capabilities, a supported value and no pending

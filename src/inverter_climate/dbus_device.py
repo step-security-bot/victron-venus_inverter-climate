@@ -531,7 +531,8 @@ class _Device:
             # GUI 1.2.40 and current gui-v2 main convert temperatures and bounds,
             # but deliberately interpret StepSize in the GUI's display unit.
             values[f"{_TEMPERATURE}/Settings/StepSize"] *= 1.8
-        elif self.temperature_unit != "celsius":
+        # Venus stores an empty string for the stock GUI's Celsius default.
+        elif self.temperature_unit not in ("", "celsius"):
             values[f"{_TEMPERATURE}/Status"] = _DISABLED
 
     def _unit_changed(self, value):
