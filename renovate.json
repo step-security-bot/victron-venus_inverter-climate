@@ -5,6 +5,14 @@
   "lockFileMaintenance": {"enabled": true},
   "packageRules": [
     {
+      "description": "Keep the reviewed post-v0.36.0 commit: the v0.36.0 tag downgrades Trivy 0.74 to 0.70. New tagged releases remain eligible.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["aquasecurity/trivy-action"],
+      "matchCurrentValue": "v0.36.0",
+      "matchUpdateTypes": ["digest"],
+      "enabled": false
+    },
+    {
       "matchManagers": ["pep621"],
       "matchUpdateTypes": ["minor", "patch"],
       "groupName": "Python dependencies"
