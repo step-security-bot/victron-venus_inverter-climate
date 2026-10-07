@@ -4,7 +4,7 @@
   "mode": "release",
   "visibility": "public",
   "default_branch": "main",
-  "validation_workflows": ["ci.yml", "release-security.yml"],
+  "validation_workflows": ["ci.yml", "release-security.yml", "dependency-review.yml"],
   "artifact_pattern": "release-assets*",
   "version_file": "version",
   "single_entry_ci": true,
